@@ -38,8 +38,20 @@ a device:
 - The bridge from the render graph's synthesized barriers to Vulkan stages and
   accesses, keyed on each resource's role in the frame
 
-Not yet built: logical device creation, command buffers, pipelines, memory
-allocation, windowing, the editor, audio, mesh loading. Those come next.
+Third pass, also device-independent:
+
+- Logical device creation with a tier-gated extension and feature set. Which
+  extensions to enable is a pure function of (tier, available), so it is
+  tested without a device; only the `vkCreateDevice` call needs one.
+- `ModernFeatures` for the Vulkan 1.3 features that cannot go in the 1.0
+  struct. `dynamic_rendering` is a 1.3 feature, so it is enabled through the
+  `Features2` pNext chain, not `pEnabledFeatures`.
+- Memory-type selection as a scoring function over the heap layout, plus buffer
+  creation, mapping, and bounds-checked mapped reads and writes.
+- A surface probe example, verified against this machine's real driver.
+
+Not yet built: command buffers, pipelines, shader compilation, windowing, the
+editor, audio, mesh loading. Those come next.
 
 The render graph (milestone 3) and scene serialization (milestone 5) were built
 ahead of the GPU work, because both are pure logic and testable without a

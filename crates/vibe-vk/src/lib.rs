@@ -6,8 +6,10 @@
 
 pub mod barrier;
 pub mod context;
+pub mod device;
 pub mod frame;
 pub mod graph_bridge;
+pub mod memory;
 pub mod swapchain;
 pub mod sync;
 
@@ -19,10 +21,15 @@ pub use context::{
     describe_device, enumerate_devices, find_queue_families, load_entry, score_device,
     select_device,
 };
+pub use device::{
+    EnabledFeatures, LogicalDevice, base_features, bindless_available, choose_extensions,
+    device_extension_names, expected_extensions,
+};
 pub use frame::{DeferredDestructionQueue, FrameConfig, FramePacer, default_frames_in_flight};
 pub use graph_bridge::{
     BackendObject, ObjectResolver, ResourceRole, encode_graph, encode_graph_for_tier, translate,
 };
+pub use memory::{BufferUsage, GpuBuffer, HeapLayout, MemoryNeed, choose_memory_type};
 pub use swapchain::{
     AcquireResult, ResizeMode, Swapchain, choose_image_count, choose_present_mode,
     choose_surface_format, clamp_extent, classify_extent,

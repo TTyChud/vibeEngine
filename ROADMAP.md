@@ -23,8 +23,23 @@ Status legend: **done** = implemented and tested, **next** = next milestone,
 | Bindless capability classification | done | `vibe-vk::sync` |
 | Device probe example, verified against real hardware | done | `vibe-vk/examples/probe.rs` |
 
-Not yet built: swapchain, command buffers, pipelines, editor, physics, audio,
-mesh loading. Those are the milestones below.
+Also done in the second pass, because they are pure logic and testable without
+a device:
+
+- Single barrier encoder emitting `vkCmdPipelineBarrier2` or
+  `vkCmdPipelineBarrier` per tier, with both spellings behind one API
+- Backend-neutral `Stage`/`Access` enums that map to both the 1.0 and 2.0 flag
+  sets, including the coarse degradations 1.0 forces
+- Frame pacing: timeline semaphores on Sync2Timeline, per-frame binary
+  semaphores and fences below it, one API for all three
+- Deferred destruction keyed on fence or timeline values
+- Swapchain format, present-mode, image-count and resize decisions, kept pure
+  so they can be tested without a driver
+- The bridge from the render graph's synthesized barriers to Vulkan stages and
+  accesses, keyed on each resource's role in the frame
+
+Not yet built: logical device creation, command buffers, pipelines, memory
+allocation, windowing, the editor, audio, mesh loading. Those come next.
 
 The render graph (milestone 3) and scene serialization (milestone 5) were built
 ahead of the GPU work, because both are pure logic and testable without a

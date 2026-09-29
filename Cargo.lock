@@ -734,6 +734,7 @@ dependencies = [
  "ash",
  "log",
  "thiserror",
+ "vibe-graph",
  "vibe-rhi",
 ]
 

@@ -248,7 +248,11 @@ pub unsafe fn create_instance(
     };
 
     let instance = unsafe { entry.create_instance(&create_info, None) }?;
-    info!("vulkan instance created");
+    let enabled: Vec<String> = extensions
+        .iter()
+        .map(|e| unsafe { CStr::from_ptr(*e) }.to_string_lossy().into_owned())
+        .collect();
+    info!("vulkan instance created with extensions: {enabled:?}");
     Ok(instance)
 }
 

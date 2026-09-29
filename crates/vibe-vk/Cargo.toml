@@ -12,6 +12,7 @@ ash.workspace = true
 log.workspace = true
 thiserror.workspace = true
 vibe-rhi.workspace = true
+vibe-graph.workspace = true
 
 [lints.rust]
 unsafe_code = "allow"

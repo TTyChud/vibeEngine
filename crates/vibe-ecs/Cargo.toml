@@ -1,0 +1,16 @@
+[package]
+name = "vibe-ecs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Sparse-set entity component system for vibeEngine"
+
+[dependencies]
+glam.workspace = true
+thiserror.workspace = true
+bytemuck.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

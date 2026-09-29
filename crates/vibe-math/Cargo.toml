@@ -1,0 +1,16 @@
+[package]
+name = "vibe-math"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Math types and helpers for vibeEngine"
+
+[dependencies]
+glam.workspace = true
+bytemuck.workspace = true
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

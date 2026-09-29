@@ -1,0 +1,17 @@
+[package]
+name = "vibe-rhi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Backend-agnostic render hardware interface for vibeEngine"
+
+[dependencies]
+bytemuck.workspace = true
+thiserror.workspace = true
+vibe-math.workspace = true
+glam.workspace = true
+
+[lints.rust]
+missing_docs = "warn"

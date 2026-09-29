@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/vibe-math",
+    "crates/vibe-jobs",
+    "crates/vibe-rhi",
+    "crates/vibe-vk",
+    "crates/vibe-ecs",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["vibeEngine contributors"]
+
+[workspace.dependencies]
+vibe-math = { path = "crates/vibe-math" }
+vibe-jobs = { path = "crates/vibe-jobs" }
+vibe-ecs = { path = "crates/vibe-ecs" }
+vibe-rhi = { path = "crates/vibe-rhi" }
+vibe-vk = { path = "crates/vibe-vk" }
+
+ash = "0.38"
+glam = { version = "0.33", features = ["bytemuck"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+thiserror = "2.0"
+log = "0.4"
+pollster = "1.0"
+raw-window-handle = "0.6"
+
+[profile.dev]
+# This box has 4 cores / 7.5 GB. Keep debug info light and avoid parallel
+# codegen so the linker does not push the box into swap.
+debug = 1
+incremental = true
+codegen-units = 256
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

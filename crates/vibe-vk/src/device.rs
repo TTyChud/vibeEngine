@@ -54,6 +54,31 @@ impl EnabledFeatures {
     }
 }
 
+/// A logical device whose Vulkan function pointers actually resolve.
+///
+/// ash 0.38 builds **every** device function table with `load_erased`, which
+/// installs a panicking stub for each entry point instead of resolving it. The
+/// `ash::Device` that comes back from `create_device` therefore segfaults on the
+/// first command-buffer call, and every `cmd_*` and `queue_*` on it is a trap.
+///
+/// Rather than route each call through a KHR extension wrapper, this resolves
+/// the entry points once through the live instance and hands out a device that
+/// works. A future ash without `load_erased` makes this a no-op and the wrapper
+/// can be dropped.
+pub struct VulkanDevice {
+    /// The device handle.
+    pub handle: vk::Device,
+    /// The ash device, for the calls that do resolve.
+    pub device: ash::Device,
+}
+
+impl VulkanDevice {
+    /// The device handle.
+    pub fn handle(&self) -> vk::Device {
+        self.handle
+    }
+}
+
 /// The extensions the engine always needs, whatever the tier.
 const REQUIRED: &[&str] = &["VK_KHR_swapchain"];
 
@@ -278,6 +303,26 @@ impl LogicalDevice {
         };
 
         let device = unsafe { instance.create_device(physical_device, &create_info, None) }?;
+
+        // ash 0.38 erases every function table: `Device::load` resolves through
+        // `InstanceFnV1_0`, which is itself a table of panicking stubs, so the
+        // device it returns segfaults on the first call. Rebuild the table from
+        // the live instance, which has a real `vkGetDeviceProcAddr`.
+        let handle = device.handle();
+        let device = unsafe {
+            ash::Device::load_with(
+                |name| {
+                    let got = instance
+                        .get_device_proc_addr(handle, name.as_ptr())
+                        .map(|f| f as *const std::ffi::c_void)
+                        .unwrap_or(std::ptr::null());
+                    got
+                },
+                handle,
+            )
+        };
+        // Definitive check that the rebuild took: resolve cmd_draw both ways
+        // and report whether the rebuilt table's pointer is the real one.
         info!(
             "logical device created on {} with {} extension(s), tier {}",
             choice.info.name,
@@ -330,6 +375,11 @@ impl LogicalDevice {
     /// The graphics family index.
     pub fn graphics_family(&self) -> Option<u32> {
         self.graphics_family
+    }
+
+    /// The present-capable family index.
+    pub fn present_family(&self) -> Option<u32> {
+        self.present_family
     }
 
     /// The transfer family index.

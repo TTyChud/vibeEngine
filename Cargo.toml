@@ -13,6 +13,7 @@ members = [
     "crates/vibe-pipeline",
     "crates/vibe-frame",
     "crates/vibe-window",
+    "crates/vibe-render",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ vibe-pipeline = { path = "crates/vibe-pipeline" }
 vibe-shader = { path = "crates/vibe-shader" }
 vibe-frame = { path = "crates/vibe-frame" }
 vibe-window = { path = "crates/vibe-window" }
+vibe-render = { path = "crates/vibe-render" }
 vibe-scene = { path = "crates/vibe-scene" }
 vibe-physics = { path = "crates/vibe-physics" }
 

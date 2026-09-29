@@ -1947,6 +1947,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibe-render"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "bytemuck",
+ "glam 0.33.11",
+ "log",
+ "naga",
+ "thiserror 2.0.21",
+ "vibe-frame",
+ "vibe-math",
+ "vibe-pipeline",
+ "vibe-rhi",
+ "vibe-shader",
+ "vibe-vk",
+ "vibe-window",
+ "winit",
+]
+
+[[package]]
 name = "vibe-rhi"
 version = "0.1.0"
 dependencies = [

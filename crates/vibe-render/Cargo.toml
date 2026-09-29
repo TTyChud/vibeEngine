@@ -1,0 +1,30 @@
+[package]
+name = "vibe-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The 2D batched quad renderer for vibeEngine"
+
+[dependencies]
+ash.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+log.workspace = true
+thiserror.workspace = true
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
+vibe-frame.workspace = true
+vibe-math.workspace = true
+vibe-pipeline.workspace = true
+vibe-rhi.workspace = true
+vibe-shader.workspace = true
+vibe-vk.workspace = true
+vibe-window.workspace = true
+
+[dev-dependencies]
+glam.workspace = true
+winit = "0.30"
+
+[lints.rust]
+unsafe_code = "allow"

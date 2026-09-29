@@ -203,7 +203,19 @@ pub unsafe fn load_entry() -> Result<Entry, VkError> {
     })
 }
 
-/// Create an instance requesting Vulkan 1.1.
+/// The highest API version the engine will ask an instance for.
+///
+/// 1.3 is the target because the barrier encoder emits
+/// `vkCmdPipelineBarrier2` and the submit path uses `vkQueueSubmit2`, both core
+/// 1.3 entry points. An instance created at 1.1 never loads them, and calling
+/// one panics inside ash rather than returning a Vulkan error.
+pub const REQUESTED_API_VERSION: ApiVersion = sync::api_version(0, 1, 3, 0);
+
+/// Create an instance requesting the highest API version available.
+///
+/// The version asked for is [`REQUESTED_API_VERSION`], clamped to whatever the
+/// loader reports, so a 1.1 loader gets a 1.1 instance and the engine still
+/// runs at the Legacy tier.
 ///
 /// Extensions that the loader does not advertise are skipped with a warning
 /// rather than failing, so a headless run without `VK_KHR_surface` still works.
@@ -216,6 +228,25 @@ pub unsafe fn create_instance(
     app_name: &CStr,
     surface_extensions: &[*const c_char],
 ) -> Result<ash::Instance, VkError> {
+    unsafe {
+        create_instance_with_version(entry, app_name, surface_extensions, REQUESTED_API_VERSION)
+    }
+}
+
+/// Create an instance at a chosen API version, clamped to the loader's.
+pub unsafe fn create_instance_with_version(
+    entry: &ash::Entry,
+    app_name: &CStr,
+    surface_extensions: &[*const c_char],
+    wanted: ApiVersion,
+) -> Result<ash::Instance, VkError> {
+    // Never ask for more than the loader implements: doing so is legal but
+    // means the 1.3 entry points come back null.
+    let loader_version = unsafe { entry.try_enumerate_instance_version() }
+        .ok()
+        .flatten()
+        .unwrap_or(v(1, 0, 0));
+    let api_version = wanted.min(loader_version);
     let available = unsafe { entry.enumerate_instance_extension_properties(None) }?;
     let available_names: Vec<&CStr> = available.iter().map(ext_name).collect();
 
@@ -237,7 +268,7 @@ pub unsafe fn create_instance(
         application_version: v(0, 1, 0),
         p_engine_name: c"vibeEngine".as_ptr(),
         engine_version: v(0, 1, 0),
-        api_version: v(1, 1, 0),
+        api_version,
         ..Default::default()
     };
     let create_info = vk::InstanceCreateInfo {
@@ -252,7 +283,10 @@ pub unsafe fn create_instance(
         .iter()
         .map(|e| unsafe { CStr::from_ptr(*e) }.to_string_lossy().into_owned())
         .collect();
-    info!("vulkan instance created with extensions: {enabled:?}");
+    info!(
+        "vulkan instance created at api {} with extensions: {enabled:?}",
+        sync::version_string(api_version)
+    );
     Ok(instance)
 }
 

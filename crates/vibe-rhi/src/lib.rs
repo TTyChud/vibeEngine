@@ -11,6 +11,9 @@
 use std::fmt;
 
 use glam::{Mat4, UVec2, Vec2, Vec3, Vec4};
+
+/// Re-exported so callers do not need glam directly for the camera type.
+pub use glam::Mat4 as Matrix4;
 use vibe_math::{Aabb2, look_at_rh, orthographic_rh, perspective_rh_reverse_z_infinite};
 
 /// Which rendering backend a resource or pipeline belongs to.

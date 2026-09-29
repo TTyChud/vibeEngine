@@ -463,7 +463,17 @@ impl BarrierEncoder {
     ///
     /// Panics if the encoder was not bound to a tier with
     /// [`BarrierEncoder::for_tier`].
-    pub unsafe fn record(&self, device: &ash::Device, command_buffer: vk::CommandBuffer) {
+    ///
+    /// `sync2` is the `VK_KHR_synchronization2` loader. It is required on the
+    /// Sync2 tiers because ash's core 1.3 device table is `load_erased`: it
+    /// installs panicking stubs for every 1.3 entry point instead of resolving
+    /// them, so a 1.3 function must be reached through its KHR extension.
+    pub unsafe fn record(
+        &self,
+        device: &ash::Device,
+        sync2: &ash::khr::synchronization2::Device,
+        command_buffer: vk::CommandBuffer,
+    ) {
         let tier = self
             .tier
             .expect("barrier encoder was not bound to a sync tier");
@@ -502,7 +512,7 @@ impl BarrierEncoder {
                 ..Default::default()
             };
             unsafe {
-                device.cmd_pipeline_barrier2(command_buffer, &info);
+                sync2.cmd_pipeline_barrier2(command_buffer, &info);
             }
         } else {
             let src = self

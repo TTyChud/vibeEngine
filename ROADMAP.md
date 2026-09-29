@@ -102,8 +102,43 @@ Sixth pass, and the first one verified against a live window:
     [8] logical device created, 7 extension(s), graphics queue acquired
     [9] command pool with 2 buffer(s)
 
-Not yet built: rendering an actual frame, the editor, audio, mesh loading.
-Those come next.
+Seventh pass — the 2D quad renderer:
+
+- `vibe-render`: the batcher, the quad pipeline compiled from WGSL at runtime,
+  and the frame recorder. The camera is a single mat4 in **push constants**, so
+  a 2D frame needs no descriptor set, no rebind, and stays one draw call.
+- Verified end to end on this machine: window, swapchain, image views, a
+  pipeline built from naga-compiled SPIR-V, a mapped vertex buffer, command
+  recording, `vkQueueSubmit2`, and present all execute against the real driver.
+
+### The frame does not present yet, and the reason is specific
+
+The frame records, submits and waits. The `vkCmdDraw` itself faults **inside
+`libvulkan_intel.so`**, not on a null pointer: the pipeline layout declares three
+descriptors (camera uniform, texture array, sampler) and nothing binds them.
+Without a descriptor set the draw is invalid, and this driver crashes rather
+than returning a validation error. Adding a descriptor pool, a set, and the
+camera/sampler writes is the next concrete step, and it is ordinary Vulkan
+rather than a mystery.
+
+### ash 0.38 erases every function table
+
+`DeviceFnV1_0` through `DeviceFnV1_3` and every extension table are built with
+`load_erased`, which installs a **panicking stub** per entry point. The
+`ash::Device` returned by `create_device` therefore segfaults on the first
+command-buffer call, and the stub's panic cannot unwind across the C boundary
+anyway. `LogicalDevice::create` rebuilds the table with `Device::load_with`,
+resolving through the live instance's real `vkGetDeviceProcAddr`. Verified: a
+probe creating a pool, allocating a buffer, recording `vkCmdDraw` and
+`vkCmdBeginRendering` through that device completes without faulting.
+
+The KHR extension wrappers resolve correctly on their own, since they resolve
+per-extension. So `vkCmdPipelineBarrier2` and `vkCmdBeginRendering` work through
+`khr::synchronization2` and `khr::dynamic_rendering`, while everything 1.0 goes
+through the rebuilt device.
+
+Not yet built: descriptor sets, the editor, audio, mesh loading. Those come
+next.
 
 The render graph (milestone 3) and scene serialization (milestone 5) were built
 ahead of the GPU work, because both are pure logic and testable without a

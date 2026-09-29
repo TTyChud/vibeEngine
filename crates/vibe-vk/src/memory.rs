@@ -543,9 +543,281 @@ mod tests {
     }
 
     #[test]
+    fn image_usage_maps_to_vulkan_flags() {
+        let f = ImageUsage::render_target().flags();
+        assert!(f.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT));
+        assert!(f.contains(vk::ImageUsageFlags::SAMPLED));
+    }
+
+    #[test]
+    fn a_depth_target_is_not_a_colour_target() {
+        let f = ImageUsage::depth_target().flags();
+        assert!(f.contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT));
+        assert!(!f.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT));
+    }
+
+    #[test]
+    fn a_texture_is_transfer_writable() {
+        let f = ImageUsage::texture().flags();
+        assert!(f.contains(vk::ImageUsageFlags::SAMPLED));
+        assert!(f.contains(vk::ImageUsageFlags::TRANSFER_DST));
+    }
+
+    #[test]
+    fn image_usage_with_nothing_set_is_rejected() {
+        assert!(ImageUsage::default().is_empty());
+    }
+
+    #[test]
     fn needs_cover_the_three_cases() {
         assert!(MemoryNeed::upload().host_visible);
         assert!(!MemoryNeed::device_local().host_visible);
         assert!(MemoryNeed::host_cached().device_local);
+    }
+}
+
+/// What an image will be used for, which decides its usage flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ImageUsage {
+    /// Written by a raster pass.
+    pub color_attachment: bool,
+    /// Written as a depth target.
+    pub depth_stencil_attachment: bool,
+    /// Sampled by a shader.
+    pub sampled: bool,
+    /// Copied into with a transfer command.
+    pub transfer_dst: bool,
+    /// Copied out of with a transfer command.
+    pub transfer_src: bool,
+}
+
+impl ImageUsage {
+    /// A colour render target that can also be sampled, as a post pass needs.
+    pub fn render_target() -> ImageUsage {
+        ImageUsage {
+            color_attachment: true,
+            sampled: true,
+            ..Default::default()
+        }
+    }
+
+    /// A depth target.
+    pub fn depth_target() -> ImageUsage {
+        ImageUsage {
+            depth_stencil_attachment: true,
+            ..Default::default()
+        }
+    }
+
+    /// A texture sampled by a shader.
+    pub fn texture() -> ImageUsage {
+        ImageUsage {
+            sampled: true,
+            transfer_dst: true,
+            ..Default::default()
+        }
+    }
+
+    /// The Vulkan usage flags for this combination.
+    pub fn flags(self) -> vk::ImageUsageFlags {
+        let mut f = vk::ImageUsageFlags::empty();
+        if self.color_attachment {
+            f |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        }
+        if self.depth_stencil_attachment {
+            f |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+        }
+        if self.sampled {
+            f |= vk::ImageUsageFlags::SAMPLED;
+        }
+        if self.transfer_dst {
+            f |= vk::ImageUsageFlags::TRANSFER_DST;
+        }
+        if self.transfer_src {
+            f |= vk::ImageUsageFlags::TRANSFER_SRC;
+        }
+        f
+    }
+
+    /// True when the combination has no usage, which Vulkan rejects.
+    pub fn is_empty(self) -> bool {
+        self.flags().is_empty()
+    }
+}
+
+/// A GPU image and a view onto it.
+pub struct GpuImage {
+    image: vk::Image,
+    view: vk::ImageView,
+    memory: vk::DeviceMemory,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+}
+
+impl std::fmt::Debug for GpuImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuImage")
+            .field("image", &self.image)
+            .field("view", &self.view)
+            .field("size", &(self.width, self.height))
+            .field("format", &self.format)
+            .finish()
+    }
+}
+
+impl GpuImage {
+    /// Create a 2D image, allocate memory for it, and make a 2D view.
+    ///
+    /// # Safety
+    ///
+    /// `device` must be a live logical device and `layout` its physical
+    /// device's heap layout.
+    pub unsafe fn create_2d(
+        device: &ash::Device,
+        layout: &HeapLayout,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: ImageUsage,
+        tiling: vk::ImageTiling,
+        samples: vk::SampleCountFlags,
+    ) -> Result<GpuImage, VkError> {
+        if width == 0 || height == 0 {
+            return Err(VkError::Swapchain(
+                "image dimensions must be non-zero".to_string(),
+            ));
+        }
+        let usage_flags = usage.flags();
+        if usage_flags.is_empty() {
+            return Err(VkError::Swapchain(
+                "image needs at least one usage flag".to_string(),
+            ));
+        }
+
+        let info = vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            format,
+            extent: vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+            mip_levels: 1,
+            array_layers: 1,
+            samples,
+            tiling,
+            usage: usage_flags,
+            sharing_mode: vk::SharingMode::EXCLUSIVE,
+            // The layout is transitioned by a barrier before first use, so
+            // there is nothing to preserve.
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            ..Default::default()
+        };
+
+        unsafe {
+            let image = device.create_image(&info, None)?;
+            let requirements = device.get_image_memory_requirements(image);
+            let Some(memory_type) = choose_memory_type(layout, MemoryNeed::device_local()) else {
+                device.destroy_image(image, None);
+                return Err(VkError::Swapchain(
+                    "no device-local memory for the image".to_string(),
+                ));
+            };
+            let alloc = vk::MemoryAllocateInfo {
+                allocation_size: requirements.size,
+                memory_type_index: memory_type,
+                ..Default::default()
+            };
+            let memory = match device.allocate_memory(&alloc, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    device.destroy_image(image, None);
+                    return Err(VkError::from(e));
+                }
+            };
+            if let Err(e) = device.bind_image_memory(image, memory, 0) {
+                device.destroy_image(image, None);
+                device.free_memory(memory, None);
+                return Err(VkError::from(e));
+            }
+
+            let view_info = vk::ImageViewCreateInfo {
+                image,
+                view_type: vk::ImageViewType::TYPE_2D,
+                format,
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: if usage.depth_stencil_attachment {
+                        vk::ImageAspectFlags::DEPTH
+                    } else {
+                        vk::ImageAspectFlags::COLOR
+                    },
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                ..Default::default()
+            };
+            let view = match device.create_image_view(&view_info, None) {
+                Ok(v) => v,
+                Err(e) => {
+                    device.destroy_image(image, None);
+                    device.free_memory(memory, None);
+                    return Err(VkError::from(e));
+                }
+            };
+
+            debug!("image created: {width}x{height} {format:?} usage {usage_flags:?}");
+            Ok(GpuImage {
+                image,
+                view,
+                memory,
+                width,
+                height,
+                format,
+            })
+        }
+    }
+
+    /// The image handle.
+    pub fn image(&self) -> vk::Image {
+        self.image
+    }
+
+    /// The view handle, which is what a render pass binds.
+    pub fn view(&self) -> vk::ImageView {
+        self.view
+    }
+
+    /// The memory handle.
+    pub fn memory(&self) -> vk::DeviceMemory {
+        self.memory
+    }
+
+    /// The image's size in pixels.
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// The image's format.
+    pub fn format(&self) -> vk::Format {
+        self.format
+    }
+
+    /// Destroy the view, image and memory.
+    ///
+    /// # Safety
+    ///
+    /// The image must not be in use by the GPU.
+    pub unsafe fn destroy(&mut self, device: &ash::Device) {
+        unsafe {
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
+        self.image = vk::Image::null();
+        self.view = vk::ImageView::null();
+        self.memory = vk::DeviceMemory::null();
     }
 }

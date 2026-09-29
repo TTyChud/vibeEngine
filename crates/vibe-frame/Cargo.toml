@@ -1,0 +1,17 @@
+[package]
+name = "vibe-frame"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Command buffers, frame resources and submission for vibeEngine"
+
+[dependencies]
+ash.workspace = true
+log.workspace = true
+thiserror.workspace = true
+vibe-vk.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"

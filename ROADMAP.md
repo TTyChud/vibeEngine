@@ -76,7 +76,33 @@ Fifth pass:
 - **Dynamic rendering** descriptions: colour and depth attachments with their
   load/store ops and clear values, plus a reverse-Z viewport.
 
-Not yet built: command buffers, windowing, the editor, audio, mesh loading.
+Sixth pass, and the first one verified against a live window:
+
+- **Command buffer pools** in `vibe-frame`: one pool per frame, one-time-submit
+  buffers, and the slot bookkeeping that keeps the CPU from running more than
+  `frames_in_flight` ahead of the GPU.
+- **Submission building** on Vulkan 1.3's `vkQueueSubmit2`, where a binary
+  semaphore wait and a timeline wait differ only in whether a value is set, so
+  both sync paths share one code path.
+- **Windowing** in `vibe-window` via winit, with per-platform surface creation:
+  Wayland on niri, XCB or XLIB on X11. The platform is decided from the raw
+  handle, so `create_instance` is asked for exactly the extension needed.
+
+### Verified end to end on this machine
+
+`cargo run -p vibe-window --example bringup` walks the whole stack and reports:
+
+    [1] loader 1.4.357
+    [2] window 936x1048 (wayland)
+    [3] platform wayland needs VK_KHR_wayland_surface
+    [4] instance created with 2 extension(s)
+    [5] vulkan surface created
+    [6] device Intel(R) UHD Graphics (TGL GT2) tier Sync2Timeline
+    [7] swapchain: B8G8R8A8_SRGB, MAILBOX, 4 images
+    [8] logical device created, 7 extension(s), graphics queue acquired
+    [9] command pool with 2 buffer(s)
+
+Not yet built: rendering an actual frame, the editor, audio, mesh loading.
 Those come next.
 
 The render graph (milestone 3) and scene serialization (milestone 5) were built
@@ -230,6 +256,15 @@ them, and it is already wired into `PhysicalDeviceInfo`.
   `cargo test -p vibe-vk` once device enumeration is live.
 - No `vulkaninfo` installed; the `probe` example covers the same ground in Rust
   and is the check to use.
+- **`&str` is not NUL terminated, and Vulkan reads until it finds a zero byte.**
+  Passing one in `ppEnabledExtensionNames` makes the driver run into adjacent
+  memory; on this machine it produced `VK_KHR_dynamic_rendering1` and a
+  corrupted `VK_KHR_swapchain`, and `vkCreateDevice` failed with
+  `ERROR_EXTENSION_NOT_PRESENT` even though every extension was present. Own
+  `CString`s instead — `EnabledFeatures::extension_cstrings` exists for this and
+  has a test that checks the trailing zero byte.
+- `ClearValue` is a C **union** with `color` and `depth_stencil` fields, not an
+  enum of Float/Color variants, and has no `Debug`.
 - ash 0.38 targets Vulkan 1.3, so several 1.0 fields are **gone** rather than
   deprecated: `PipelineRasterizationStateCreateInfo` has no `depth_clip_enable`
   or `depth_bounds_enable` (both are now always on), and

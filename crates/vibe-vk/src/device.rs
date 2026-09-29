@@ -37,11 +37,19 @@ impl EnabledFeatures {
         self.missing.is_empty()
     }
 
-    /// The extension names as C strings, for `ppEnabledExtensionNames`.
-    pub fn extension_ptrs(&self) -> Vec<*const c_char> {
+    /// The extension names as nul-terminated C strings.
+    ///
+    /// The Vulkan API reads each name until a zero byte, so a plain `&str` is
+    /// not enough: it has no terminator and the driver would run into whatever
+    /// follows in memory. Owning `CString`s makes the terminator explicit.
+    pub fn extension_cstrings(&self) -> Result<Vec<std::ffi::CString>, VkError> {
         self.extensions
             .iter()
-            .map(|e| e.as_ptr() as *const c_char)
+            .map(|e| {
+                std::ffi::CString::new(e.as_str()).map_err(|_| {
+                    VkError::Swapchain(format!("extension name {e:?} contains a nul byte"))
+                })
+            })
             .collect()
     }
 }
@@ -254,7 +262,12 @@ impl LogicalDevice {
             })
             .collect();
 
-        let extension_ptrs = enabled.extension_ptrs();
+        let extension_names = enabled.extension_cstrings()?;
+        let extension_ptrs: Vec<*const c_char> =
+            extension_names.iter().map(|c| c.as_ptr()).collect();
+        for name in &extension_names {
+            debug!("enabling device extension {:?}", name.to_string_lossy());
+        }
         let create_info = vk::DeviceCreateInfo {
             queue_create_info_count: queue_infos.len() as u32,
             p_queue_create_infos: queue_infos.as_ptr(),
@@ -619,10 +632,38 @@ mod tests {
     }
 
     #[test]
-    fn extension_ptrs_match_the_list() {
-        let e = choose_extensions(SyncTier::Legacy, &extensions(&["VK_KHR_swapchain"]));
-        let ptrs = e.extension_ptrs();
-        assert_eq!(ptrs.len(), e.extensions.len());
+    fn extension_names_are_nul_terminated() {
+        // vkCreateDevice reads each name until a zero byte. A `&str` has no
+        // terminator, so passing one makes the driver run into whatever follows
+        // in memory and reject the device with ERROR_EXTENSION_NOT_PRESENT.
+        // This test is the reason that bug was found.
+        let e = choose_extensions(
+            SyncTier::Sync2Timeline,
+            &extensions(&[
+                "VK_KHR_swapchain",
+                "VK_KHR_synchronization2",
+                "VK_KHR_timeline_semaphore",
+            ]),
+        );
+        let names = e.extension_cstrings().unwrap();
+        assert_eq!(names.len(), e.extensions.len());
+        for (c, want) in names.iter().zip(e.extensions.iter()) {
+            assert_eq!(c.to_str().unwrap(), want.as_str());
+            assert_eq!(
+                c.to_bytes_with_nul().last(),
+                Some(&0),
+                "every name must end in a nul byte"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_with_a_nul_byte_is_rejected() {
+        // A name carrying an interior nul would silently truncate, so it is an
+        // error rather than a silently shortened request.
+        let mut e = choose_extensions(SyncTier::Legacy, &extensions(&["VK_KHR_swapchain"]));
+        e.extensions.push("VK_KHR_broken\u{0}name".to_string());
+        assert!(e.extension_cstrings().is_err());
     }
 
     #[test]

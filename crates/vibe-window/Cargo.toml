@@ -1,0 +1,22 @@
+[package]
+name = "vibe-window"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Windowing and surface creation for vibeEngine"
+
+[dependencies]
+ash.workspace = true
+log.workspace = true
+raw-window-handle.workspace = true
+thiserror.workspace = true
+vibe-vk.workspace = true
+winit = "0.30"
+
+[dev-dependencies]
+vibe-frame.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"

@@ -1,4 +1,10 @@
-//! Records a trivial command buffer through a rebuilt device table.
+//! Proves the logical device's function table really resolves.
+//!
+//! ash 0.38 hands back an erased device whose entries are panicking stubs, so
+//! the first command-buffer call segfaults. This creates a pool, allocates a
+//! command buffer, records a `vkCmdDraw` and a dynamic-rendering scope, and
+//! reports success. A fault here means the rebuild in `LogicalDevice::create`
+//! regressed.
 //!
 //! Run with: WAYLAND_DISPLAY=wayland-1 cargo run -p vibe-vk --example devtable
 

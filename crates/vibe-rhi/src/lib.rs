@@ -467,6 +467,16 @@ impl ResourceHandle {
     pub const fn is_invalid(self) -> bool {
         self.index == u32::MAX
     }
+
+    /// The slot index.
+    pub const fn index(self) -> u32 {
+        self.index
+    }
+
+    /// The generation, bumped on every free.
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
 }
 
 impl Default for ResourceHandle {

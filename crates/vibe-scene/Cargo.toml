@@ -1,0 +1,18 @@
+[package]
+name = "vibe-scene"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "YAML scene serialization and the virtual filesystem for vibeEngine"
+
+[dependencies]
+serde = { workspace = true }
+serde_norway = "0.9"
+glam.workspace = true
+thiserror.workspace = true
+vibe-ecs.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

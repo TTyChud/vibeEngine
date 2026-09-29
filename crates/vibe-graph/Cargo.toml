@@ -1,0 +1,16 @@
+[package]
+name = "vibe-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Frame graph: resource registry, pass graph, barrier synthesis, execution"
+
+[dependencies]
+thiserror.workspace = true
+vibe-jobs.workspace = true
+vibe-rhi.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

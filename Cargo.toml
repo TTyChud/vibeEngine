@@ -6,6 +6,8 @@ members = [
     "crates/vibe-rhi",
     "crates/vibe-vk",
     "crates/vibe-ecs",
+    "crates/vibe-graph",
+    "crates/vibe-scene",
 ]
 
 [workspace.package]
@@ -21,8 +23,12 @@ vibe-jobs = { path = "crates/vibe-jobs" }
 vibe-ecs = { path = "crates/vibe-ecs" }
 vibe-rhi = { path = "crates/vibe-rhi" }
 vibe-vk = { path = "crates/vibe-vk" }
+vibe-graph = { path = "crates/vibe-graph" }
+vibe-scene = { path = "crates/vibe-scene" }
 
 ash = "0.38"
+serde = { version = "1", features = ["derive"] }
+serde_norway = "0.9"
 glam = { version = "0.33", features = ["bytemuck"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 thiserror = "2.0"

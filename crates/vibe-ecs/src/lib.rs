@@ -4,7 +4,7 @@
 //! order for cache locality, plus a sparse index from entity slot to dense
 //! position. No external ECS dependency.
 
-mod components;
+pub mod components;
 mod entity;
 mod erased;
 mod schedule;

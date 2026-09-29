@@ -23,8 +23,14 @@ Status legend: **done** = implemented and tested, **next** = next milestone,
 | Bindless capability classification | done | `vibe-vk::sync` |
 | Device probe example, verified against real hardware | done | `vibe-vk/examples/probe.rs` |
 
-Not yet built: swapchain, command buffers, pipelines, render graph, editor,
-physics, audio, assets. Those are the milestones below.
+Not yet built: swapchain, command buffers, pipelines, editor, physics, audio,
+mesh loading. Those are the milestones below.
+
+The render graph (milestone 3) and scene serialization (milestone 5) were built
+ahead of the GPU work, because both are pure logic and testable without a
+device. That is why they are done and the swapchain is not: a frame graph you
+cannot execute yet still forces the API to be right, and it is the piece that
+decides what the swapchain has to support.
 
 ## Milestone 2 — Draw a triangle (vertical slice)
 
@@ -46,18 +52,26 @@ showing a textured quad.
 - 2D batched quad renderer with draw-call and quad counters
 - Windowing via `winit` + `raw-window-handle`
 
-## Milestone 3 — Render graph
+## Milestone 3 — Render graph (DONE, `vibe-graph`)
 
-- Resource registry with generation counters and versioning
-- Import vs declare
-- Pass builder with auto-publish and implied writes from attachments
-- Read/write dependency tracking per pass
-- Compiler: topological sort, dead-pass culling
-- Synthesized pre/post image and buffer barriers
-- Resource lifetime analysis (first/last use, first write)
-- Executor mapping handles to live Vulkan objects
-- Graph mapped onto `TaskGraph` as a DAG
+Modelled on Godot's RenderingDevice dependency tracking and Unreal's RDG.
+
+- Resource registry with generation counters and versioning — done
+- Import vs declare, so the graph never frees a swapchain image — done
+- Pass builder with read/write/discard declarations — done
+- Compiler: topological sort, dead-pass culling — done
+- Synthesized image and buffer barriers, with execution-dependency classification
+- Resource lifetime analysis (first/last use, first write) — done
 - Typed validation errors, JSON dump, topology hash for frame-change detection
+- Executor mapping handles to live backend objects, validating before any GPU work
+- Graph mapped onto `TaskGraph` as a DAG — done
+- **Transient aliasing** — the point of the whole thing. Interval-graph
+  colouring gives disjoint live ranges one shared allocation. In the test case
+  two 1 KiB transients in sequential passes cost 1 KiB, not 2.
+
+Still to do for the milestone to be usable on the GPU: the executor's
+`ResourceResolver` needs a Vulkan implementation, and the barriers need
+translating into the tier-gated encoder.
 
 ## Milestone 4 — Physics
 
@@ -81,16 +95,21 @@ in behind it.
 - Per-axis DOF locking, sensors
 - Native script binding via `ScriptableEntity` (C++ subclassing, not Lua)
 
-## Milestone 5 — Assets and text
+## Milestone 5 — Assets and text (partly done)
 
-- glTF/GLB via `fastgltf`: meshes, materials, skins
+- glTF/GLB via `gltf` 1.4 (not `fastgltf`, which is not a real crate): meshes,
+  materials, skins
 - Skeletal animation: position, rotation, scale interpolation
 - Bone matrix skinning in the shader, 4096 bones per frame
 - MSDF text with runtime font atlas generation
 - Kerning, line spacing, glyph cache
 - 2D sprite sheet animation with frame timing and looping
-- Virtual filesystem rooted at the executable
-- YAML scene serialization, both directions
+- Virtual filesystem rooted at the executable — done, `vibe-scene::vfs`
+- YAML scene serialization, both directions — done, `vibe-scene::scene`.
+  Uses `serde_norway`, because `serde_yaml` and `serde_yml` are both deprecated.
+  Component values are stored untagged under their component name, so a scene
+  written by a newer build still loads in an older one minus the parts it does
+  not know.
 
 ## Milestone 6 — Audio
 

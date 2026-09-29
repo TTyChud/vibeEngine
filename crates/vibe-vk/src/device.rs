@@ -233,6 +233,9 @@ pub struct LogicalDevice {
     pub handle: vk::Device,
     /// The features that were enabled.
     pub features: EnabledFeatures,
+    /// The physical device's memory heap layout, kept so a caller can allocate
+    /// buffers and images without re-querying the physical device.
+    pub memory_layout: crate::memory::HeapLayout,
     queues: Vec<(u32, vk::Queue)>,
     /// Present-capable queue family, if one was requested.
     pub present_family: Option<u32>,
@@ -338,10 +341,29 @@ impl LogicalDevice {
             queues.push((*family, unsafe { device.get_device_queue(*family, 0) }));
         }
 
+        // Keep the heap layout: every buffer and image allocation needs it, and
+        // a caller should not have to re-query the physical device for it.
+        let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let memory_layout = crate::memory::HeapLayout {
+            property_flags: props.memory_types[..props.memory_type_count as usize]
+                .iter()
+                .map(|m| m.property_flags)
+                .collect(),
+            heap_index: props.memory_types[..props.memory_type_count as usize]
+                .iter()
+                .map(|m| m.heap_index)
+                .collect(),
+            heap_sizes: props.memory_heaps[..props.memory_heap_count as usize]
+                .iter()
+                .map(|m| m.size)
+                .collect(),
+        };
+
         Ok(LogicalDevice {
             handle: device.handle(),
             device,
             features: enabled,
+            memory_layout,
             queues,
             present_family: choice.present_family,
             graphics_family: choice.graphics_family,
@@ -375,6 +397,11 @@ impl LogicalDevice {
     /// The graphics family index.
     pub fn graphics_family(&self) -> Option<u32> {
         self.graphics_family
+    }
+
+    /// The memory heap layout, for allocating buffers and images.
+    pub fn memory_layout(&self) -> &crate::memory::HeapLayout {
+        &self.memory_layout
     }
 
     /// The present-capable family index.

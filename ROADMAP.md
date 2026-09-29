@@ -137,8 +137,35 @@ per-extension. So `vkCmdPipelineBarrier2` and `vkCmdBeginRendering` work through
 `khr::synchronization2` and `khr::dynamic_rendering`, while everything 1.0 goes
 through the rebuilt device.
 
-Not yet built: descriptor sets, the editor, audio, mesh loading. Those come
-next.
+Eighth pass — the frame renders:
+
+- The **descriptor set** the quad shader needs: a camera uniform buffer, a
+  texture and a sampler, with a pool sized from the description. Without it the
+  draw is invalid, and this driver crashes rather than reporting it.
+- **Image upload** through a staging buffer and `vkCmdCopyBufferToImage`, with
+  the two barriers that take an image from `UNDEFINED` to
+  `SHADER_READ_ONLY_OPTIMAL`. An image created but never written holds
+  undefined memory that a sampling shader reads.
+- **Readback**, so a frame can be verified rather than assumed: the image is
+  copied to a host buffer and a colour histogram is reported. A successful
+  present only proves the driver accepted the work.
+
+### Three bugs the readback caught that a "presented successfully" check would not
+
+1. **Blend factors were never written.** `blend_enable` was set but the factors
+   stayed at their default of `ZERO`, so every fragment computed
+   `src*0 + dst*0` and the draw erased itself, leaving only the clear. The
+   factors existed in `BlendState` and were discarded at the call site. Fixed by
+   giving `BlendState` separate `color_factors` and `alpha_factors`: alpha
+   blending must use `ONE`/`ONE_MINUS_SRC_ALPHA` for alpha, not `SRC_ALPHA`,
+   or translucent sprites fade twice.
+2. **The camera was described as push constants but implemented as a uniform
+   buffer**, and the dead push path was still inflating the pipeline's push
+   constant range. Removed, with the comment corrected to match the code.
+3. **A zero-size push constant range is a validation error**, so the range is
+   now declared only when the pipeline actually uses one.
+
+Not yet built: the editor, audio, mesh loading. Those come next.
 
 The render graph (milestone 3) and scene serialization (milestone 5) were built
 ahead of the GPU work, because both are pure logic and testable without a

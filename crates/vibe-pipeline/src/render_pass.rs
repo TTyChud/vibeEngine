@@ -227,8 +227,9 @@ pub fn begin_rendering_info<'a>(
     Vec<vk::RenderingAttachmentInfo<'a>>,
     Option<vk::RenderingAttachmentInfo<'a>>,
 ) {
+    // Dynamic rendering takes no per-attachment blend state: blending is
+    // a property of the pipeline, not of the pass.
     for (info, attachment) in color_refs.iter_mut().zip(desc.colors.iter()) {
-        let (_, _, _blend_op, _) = attachment.blend.factors();
         *info = vk::RenderingAttachmentInfo {
             image_view: attachment.view,
             image_layout: attachment.base_layout,

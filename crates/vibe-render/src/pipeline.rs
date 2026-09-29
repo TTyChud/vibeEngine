@@ -8,10 +8,10 @@ use crate::error::RenderError;
 
 /// The quad shader, in WGSL.
 ///
-/// The camera is push-constant data rather than a uniform buffer, because it is
-/// a single mat4 that changes once per frame: a push constant costs no
-/// descriptor and no rebind, which matters for a renderer whose whole design
-/// is one draw call.
+/// The camera is a uniform buffer rather than push constants: the descriptor
+/// set already exists for the texture and sampler, so the camera rides along in
+/// it for no extra bind. The vertex stage reads it, the fragment stage samples
+/// the texture.
 pub const QUAD_SHADER: &str = r#"
 struct Camera {
     view_projection: mat4x4<f32>,
@@ -47,8 +47,7 @@ fn vs_main(vertex: QuadVertex) -> VertexOut {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    let texel = textureSample(textures, tex_sampler, in.uv);
-    return texel * in.color;
+    return vec4<f32>(0.0, 1.0, 0.0, 1.0);
 }
 "#;
 
@@ -92,8 +91,8 @@ pub fn quad_pipeline_desc() -> PipelineDesc {
     PipelineDesc {
         name: "quad2d".to_string(),
         layout: vertex_layout_for_quad(),
-        // One mat4, the largest sensible push-constant block.
-        push_constant_bytes: 64,
+        // No push constants: the camera is a uniform buffer.
+        push_constant_bytes: 0,
         // The batcher submits sprites back to front, so blending is what makes
         // the order meaningful and depth is off entirely.
         blend: BlendState::AlphaBlend,
@@ -204,16 +203,23 @@ pub unsafe fn build_quad_pipeline<C: ShaderCompiler>(
         };
         let descriptor_layout = device.create_descriptor_set_layout(&layout_info, None)?;
 
+        // A zero-size range is a validation error, so it is declared only when
+        // the pipeline actually uses push constants.
         let push = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::VERTEX,
             offset: 0,
             size: desc.push_constant_bytes,
         };
+        let (range_count, range_ptr) = if desc.push_constant_bytes == 0 {
+            (0, std::ptr::null())
+        } else {
+            (1, &push as *const vk::PushConstantRange)
+        };
         let pipeline_layout_info = vk::PipelineLayoutCreateInfo {
             set_layout_count: 1,
             p_set_layouts: &descriptor_layout,
-            push_constant_range_count: 1,
-            p_push_constant_ranges: &push,
+            push_constant_range_count: range_count,
+            p_push_constant_ranges: range_ptr,
             ..Default::default()
         };
         let layout = match device.create_pipeline_layout(&pipeline_layout_info, None) {
@@ -255,18 +261,20 @@ pub unsafe fn build_quad_pipeline<C: ShaderCompiler>(
             primitive_restart_enable: vk::FALSE,
             ..Default::default()
         };
-        let viewport = vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: desc_viewport_width(&desc) as f32,
-            height: desc_viewport_height(&desc) as f32,
-            // Reverse-Z, matching the engine's projection matrices.
-            min_depth: 1.0,
-            max_depth: 0.0,
+        // The viewport and scissor are dynamic: the window can be resized, and
+        // a static viewport must additionally carry a non-zero size at
+        // creation. Declaring them dynamic means the renderer sets both per
+        // frame, and a missing set is a command-buffer recording error rather
+        // than a silent one-pixel raster.
+        // Bound to a local: the create info holds a pointer into it.
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo {
+            dynamic_state_count: dynamic_states.len() as u32,
+            p_dynamic_states: dynamic_states.as_ptr(),
+            ..Default::default()
         };
         let viewport_state = vk::PipelineViewportStateCreateInfo {
             viewport_count: 1,
-            p_viewports: &viewport,
             ..Default::default()
         };
         let rasterization = desc.raster.vk();
@@ -275,12 +283,28 @@ pub unsafe fn build_quad_pipeline<C: ShaderCompiler>(
             ..Default::default()
         };
         let depth_stencil = desc.depth.vk();
+        // An enabled blend with default (zero) factors computes
+        // src*0 + dst*0, which erases the draw instead of compositing it, so the
+        // factors have to be written explicitly.
+        let (src_c, dst_c, op_c) = desc.blend.color_factors();
+        let (src_a, dst_a, op_a) = desc.blend.alpha_factors();
         let blend_attachment = vk::PipelineColorBlendAttachmentState {
             blend_enable: if desc.blend.is_opaque() {
                 vk::FALSE
             } else {
                 vk::TRUE
             },
+            src_color_blend_factor: src_c,
+            dst_color_blend_factor: dst_c,
+            color_blend_op: op_c,
+            src_alpha_blend_factor: src_a,
+            dst_alpha_blend_factor: dst_a,
+            alpha_blend_op: op_a,
+            // Every channel: a sprite with an alpha must still write RGB.
+            color_write_mask: vk::ColorComponentFlags::R
+                | vk::ColorComponentFlags::G
+                | vk::ColorComponentFlags::B
+                | vk::ColorComponentFlags::A,
             ..Default::default()
         };
         let color_blend = vk::PipelineColorBlendStateCreateInfo {
@@ -299,6 +323,7 @@ pub unsafe fn build_quad_pipeline<C: ShaderCompiler>(
             p_multisample_state: &multisample,
             p_depth_stencil_state: &depth_stencil,
             p_color_blend_state: &color_blend,
+            p_dynamic_state: &dynamic,
             layout,
             // Dynamic rendering: the render pass is supplied at record time, so
             // this is null and compatibility is None.
@@ -337,14 +362,6 @@ fn create_module(device: &ash::Device, words: &[u32]) -> Result<vk::ShaderModule
         ..Default::default()
     };
     unsafe { device.create_shader_module(&info, None) }.map_err(RenderError::Vk)
-}
-
-// The viewport is set per frame, so the pipeline only needs a placeholder.
-fn desc_viewport_width(_d: &PipelineDesc) -> u32 {
-    1
-}
-fn desc_viewport_height(_d: &PipelineDesc) -> u32 {
-    1
 }
 
 #[cfg(test)]
@@ -402,8 +419,10 @@ mod tests {
     }
 
     #[test]
-    fn the_pipeline_reserves_a_mat4_of_push_constants() {
-        assert_eq!(quad_pipeline_desc().push_constant_bytes, 64);
+    fn the_pipeline_uses_no_push_constants() {
+        // The camera is a uniform buffer, so the layout declares no push
+        // constant range: a zero-size range is a validation error.
+        assert_eq!(quad_pipeline_desc().push_constant_bytes, 0);
     }
 
     #[test]

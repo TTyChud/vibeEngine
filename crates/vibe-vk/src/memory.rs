@@ -805,6 +805,59 @@ impl GpuImage {
         self.format
     }
 
+    /// Record a copy of `staging`'s contents into this image.
+    ///
+    /// The image must have been created with [`ImageUsage::texture`], which
+    /// includes `TRANSFER_DST`, and the caller must have transitioned it to
+    /// `TRANSFER_DST_OPTIMAL` beforehand. An image left in `UNDEFINED` and
+    /// never written holds undefined memory, which a sampling shader reads.
+    ///
+    /// # Safety
+    ///
+    /// `command_buffer` must be recording, and `staging` must hold at least
+    /// `width * height * 4` bytes.
+    pub unsafe fn record_upload(
+        &self,
+        device: &ash::Device,
+        command_buffer: vk::CommandBuffer,
+        staging: vk::Buffer,
+    ) -> Result<(), VkError> {
+        let region = vk::BufferImageCopy {
+            buffer_offset: 0,
+            // Zero means "tightly packed to the image width", which is what a
+            // single-row or single-texel image wants.
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D {
+                width: self.width,
+                height: self.height,
+                depth: 1,
+            },
+        };
+        unsafe {
+            device.cmd_copy_buffer_to_image(
+                command_buffer,
+                staging,
+                self.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+        }
+        Ok(())
+    }
+
+    /// Bytes an image of this size needs for an RGBA8 upload.
+    pub fn upload_size(&self) -> u64 {
+        (self.width as u64) * (self.height as u64) * 4
+    }
+
     /// Destroy the view, image and memory.
     ///
     /// # Safety

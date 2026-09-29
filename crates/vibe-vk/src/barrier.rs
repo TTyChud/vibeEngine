@@ -29,6 +29,8 @@ pub enum Stage {
     ComputeShader,
     Transfer,
     BottomOfPipe,
+    /// The host, for a readback: the CPU observing what the GPU wrote.
+    Host,
     /// All commands in the previous submission.
     AllCommands,
 }
@@ -48,6 +50,7 @@ impl Stage {
             Stage::ComputeShader => vk::PipelineStageFlags2::COMPUTE_SHADER,
             Stage::Transfer => vk::PipelineStageFlags2::TRANSFER,
             Stage::BottomOfPipe => vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+            Stage::Host => vk::PipelineStageFlags2::HOST,
             Stage::AllCommands => vk::PipelineStageFlags2::ALL_COMMANDS,
         }
     }
@@ -71,6 +74,7 @@ impl Stage {
             Stage::ComputeShader => vk::PipelineStageFlags::COMPUTE_SHADER,
             Stage::Transfer => vk::PipelineStageFlags::TRANSFER,
             Stage::BottomOfPipe => vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            Stage::Host => vk::PipelineStageFlags::HOST,
             Stage::AllCommands => vk::PipelineStageFlags::ALL_COMMANDS,
         }
     }
@@ -260,6 +264,19 @@ impl Barrier {
     /// Override the resource kind, which the constructors infer.
     pub fn with_kind(mut self, kind: ResourceKind) -> Barrier {
         self.kind = kind;
+        self
+    }
+
+    /// A whole-device memory barrier with no resource, for a global transition.
+    pub fn memory_barrier() -> Barrier {
+        Barrier::memory(Stage::None, Access::None, Stage::None, Access::None)
+    }
+
+    /// Target a buffer range, for a buffer barrier.
+    pub fn buffer_range(mut self, offset: u64, size: u64) -> Barrier {
+        self.kind = ResourceKind::Buffer;
+        self.offset = offset;
+        self.size = size;
         self
     }
 

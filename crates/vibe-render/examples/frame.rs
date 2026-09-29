@@ -10,7 +10,7 @@ use ash::vk;
 use vibe_rhi::SubTexture;
 use vibe_shader::WgslCompiler;
 use vibe_vk::context::{QueueRequirements, VkError};
-use vibe_vk::memory::{BufferUsage, GpuBuffer, HeapLayout, ImageUsage, MemoryNeed};
+use vibe_vk::memory::{BufferUsage, GpuBuffer, GpuImage, HeapLayout, ImageUsage, MemoryNeed};
 use vibe_window::{SurfaceKind, surface};
 
 /// How long to wait for the GPU, in nanoseconds.
@@ -147,9 +147,11 @@ fn main() {
             }
         };
     println!(
-        "[3] swapchain {}x{} images {} format {:?} present {:?}",
+        "[3] swapchain {}x{} window {}x{} images {} format {:?} present {:?}",
         swapchain.extent().width,
         swapchain.extent().height,
+        w,
+        h,
         swapchain_images.len(),
         swapchain.format().format,
         swapchain.present_mode()
@@ -210,35 +212,199 @@ fn main() {
     let sync2 = ash::khr::synchronization2::Device::new(&instance, device);
     println!("[5] quad pipeline built (key {:#x})", pipeline.cache_key);
 
+    // 5b. The three descriptors the shader reads: a camera uniform, a texture
+    // and a sampler. A draw that leaves any of them unbound is invalid.
+    let camera = match unsafe {
+        GpuBuffer::create(
+            device,
+            &heap_layout,
+            std::mem::size_of::<glam::Mat4>() as u64,
+            BufferUsage {
+                uniform: true,
+                ..Default::default()
+            },
+            MemoryNeed::upload(),
+        )
+    } {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("FAIL camera buffer: {e}");
+            return;
+        }
+    };
+    let mut camera = camera;
+    if let Err(e) = unsafe { camera.map(device) } {
+        eprintln!("FAIL camera map: {e}");
+        return;
+    }
+
+    // A 1x1 opaque white texel, so an untextured quad samples as solid colour
+    // and the fragment path is exercised rather than skipped.
+    let texture = match unsafe {
+        GpuImage::create_2d(
+            device,
+            &heap_layout,
+            1,
+            1,
+            vk::Format::R8G8B8A8_UNORM,
+            ImageUsage::texture(),
+            vk::ImageTiling::OPTIMAL,
+            vk::SampleCountFlags::TYPE_1,
+        )
+    } {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("FAIL texture: {e}");
+            return;
+        }
+    };
+    // A 1x1 image created but never written holds undefined memory, and the
+    // fragment shader samples it. Stage the white texel, then copy it in.
+    let texel: [u8; 4] = [255, 255, 255, 255];
+    let mut staging = match unsafe {
+        GpuBuffer::create(
+            device,
+            &heap_layout,
+            4,
+            BufferUsage {
+                transfer_src: true,
+                ..Default::default()
+            },
+            MemoryNeed::upload(),
+        )
+    } {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("FAIL staging buffer: {e}");
+            return;
+        }
+    };
+    if let Err(e) = unsafe { staging.map(device) } {
+        eprintln!("FAIL staging map: {e}");
+        return;
+    }
+    if let Err(e) = unsafe { staging.write_mapped(0, &texel) } {
+        eprintln!("FAIL texel upload: {e}");
+        return;
+    }
+    println!("[5a] white texel staged ({} bytes)", texel.len());
+
+    // The upload is its own submission: undefined -> transfer destination, copy,
+    // then transfer destination -> shader-read-only, which is the layout the
+    // descriptor promises. A descriptor pointing at the wrong layout is a
+    // validation error and, on this driver, a lost device.
+    let upload_pool = match unsafe {
+        vibe_frame::CommandPool::new(device, logical.graphics_family().unwrap_or(0), 1)
+    } {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("FAIL upload pool: {e}");
+            return;
+        }
+    };
+    let upload_cmd = match unsafe { upload_pool.begin(device, 0) } {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("FAIL upload begin: {e}");
+            return;
+        }
+    };
+    {
+        let mut enc = vibe_vk::BarrierEncoder::for_tier(logical.sync_tier());
+        enc.push(
+            vibe_vk::Barrier::image(texture.image(), vk::ImageAspectFlags::COLOR)
+                .src(vibe_vk::Stage::None, vibe_vk::Access::None)
+                .dst(vibe_vk::Stage::Transfer, vibe_vk::Access::TransferWrite),
+        );
+        unsafe { enc.record(device, &sync2, upload_cmd) };
+        if let Err(e) = unsafe { texture.record_upload(device, upload_cmd, staging.buffer()) } {
+            eprintln!("FAIL record upload: {e}");
+            return;
+        }
+        let mut enc2 = vibe_vk::BarrierEncoder::for_tier(logical.sync_tier());
+        enc2.push(
+            vibe_vk::Barrier::image(texture.image(), vk::ImageAspectFlags::COLOR)
+                .src(vibe_vk::Stage::Transfer, vibe_vk::Access::TransferWrite)
+                .dst(vibe_vk::Stage::FragmentShader, vibe_vk::Access::ShaderRead),
+        );
+        unsafe { enc2.record(device, &sync2, upload_cmd) };
+    }
+    if let Err(e) = unsafe { upload_pool.end(device, 0) } {
+        eprintln!("FAIL upload end: {e}");
+        return;
+    }
+    // No semaphore: the upload is CPU-waited on a fence, and nothing else
+    // touches the texture until the frame is submitted.
+    let upload_batch = vibe_frame::SubmitBatch::single(upload_cmd, vibe_frame::SubmitSync::None);
+    let upload_submission = vibe_frame::build_submit_info(&upload_batch);
+    let upload_fence =
+        unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
+    if let Err(e) =
+        unsafe { sync2.queue_submit2(graphics_queue, &[upload_submission.info], upload_fence) }
+    {
+        eprintln!("FAIL upload submit: {e:?}");
+        return;
+    }
+    if let Err(e) = unsafe { device.wait_for_fences(&[upload_fence], true, TIMEOUT) } {
+        eprintln!("FAIL upload wait: {e:?}");
+        return;
+    }
+    unsafe { device.destroy_fence(upload_fence, None) };
+    println!("[5b] texture uploaded: undefined -> transfer dst -> shader read only");
+
+    let sampler = match vibe_render::create_sampler(device) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("FAIL sampler: {e}");
+            return;
+        }
+    };
+    let bind_group = match unsafe {
+        vibe_render::BindGroup::create(
+            device,
+            pipeline.descriptor_layout,
+            &vibe_render::BindGroupDesc::default(),
+            camera.buffer(),
+            std::mem::size_of::<glam::Mat4>() as u64,
+            texture.view(),
+            sampler,
+        )
+    } {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("FAIL bind group: {e}");
+            return;
+        }
+    };
+    println!("[5b] bind group created: camera, 1x1 white texture, nearest sampler");
+
     // 6. The renderer and a batch of quads
+    // Write the camera matrix before the draw: the descriptor points at this
+    // buffer, and the shader reads it in the vertex stage.
+    let matrix = renderer_camera_matrix(w as f32, h as f32);
+    if let Err(e) = unsafe { camera.write_mapped(0, bytemuck::bytes_of(&matrix)) } {
+        eprintln!("FAIL camera upload: {e}");
+        return;
+    }
+    println!(
+        "[5c] camera matrix uploaded ({} bytes)",
+        std::mem::size_of::<glam::Mat4>()
+    );
+
     let mut renderer = vibe_render::QuadRenderer::new(
+        bind_group,
         pipeline,
         vibe_render::RendererDesc::new(w, h, swapchain.format().format),
     );
     {
         let batcher = renderer.batcher_mut();
         let tex = SubTexture::full(0);
-        // A visible quad, then ones drifting off each edge, then one rotated:
-        // the mix exercises blending, culling and the rotation path together.
-        for (i, y) in [40.0f32, 120.0, 200.0, 280.0, 360.0].iter().enumerate() {
-            let color = [
-                (60 + i as u32 * 40) as u8,
-                (200 - i as u32 * 30) as u8,
-                255,
-                255,
-            ];
-            let _ = batcher.push_quad(
-                glam::Vec2::new(100.0 + i as f32 * 60.0, *y),
-                glam::Vec2::new(120.0, 60.0),
-                color,
-                &tex,
-            );
-        }
-        let _ = batcher.push_rotated(
-            glam::Vec2::new(420.0, 420.0),
-            glam::Vec2::new(140.0, 60.0),
-            0.4,
-            [255, 180, 60, 255],
+        // A column of translucent quads in different hues, so the readback can
+        // tell each one apart, then one rotated, then one off-screen.
+        let _ = batcher.push_quad(
+            glam::Vec2::ZERO,
+            glam::Vec2::new(w as f32, h as f32),
+            [255, 0, 0, 255],
             &tex,
         );
         let _ = batcher.push_quad(
@@ -276,15 +442,15 @@ fn main() {
             return;
         }
     };
-    if let Err(e) = unsafe {
-        if let Err(e) = vertex_buffer.map(device) {
-            eprintln!("FAIL vertex map: {e}");
-            return;
-        }
-        let data = bytemuck::cast_slice(renderer.batcher().vertices());
-        vertex_buffer.write_mapped(0, data)
-    } {
-        eprintln!("FAIL vertex upload: {e}");
+    // Map, upload, and read back: the read-back bytes are exactly what the
+    // draw fetches, so it separates a bad upload from a bad draw.
+    if let Err(e) = unsafe { vertex_buffer.map(device) } {
+        eprintln!("FAIL vertex map: {e}");
+        return;
+    }
+    let vertex_data = bytemuck::cast_slice(renderer.batcher().vertices());
+    if let Err(e) = unsafe { vertex_buffer.write_mapped(0, vertex_data) } {
+        eprintln!("FAIL vertex write: {e}");
         return;
     }
     println!("[7] vertex buffer uploaded");
@@ -427,10 +593,19 @@ fn main() {
         return;
     }
 
+    // `vkAcquireNextImageKHR` signalled `signal`, meaning "this image is ready to
+    // render into", so the frame must wait on it before drawing. Waiting on and
+    // signalling the same binary semaphore is legal for a single frame, and the
+    // timeline path handles the steady state by waiting on the previous frame's
+    // value and signalling the next.
     let sync = match resources.timeline_semaphore() {
+        // On the timeline path the acquire raised the timeline to the frame's
+        // own value, so waiting for the previous frame's value covers the
+        // acquire too: on frame one that is 0, which the acquire has already
+        // passed, so the wait does not block.
         Some(sem) => vibe_frame::SubmitSync::Timeline {
             semaphore: sem,
-            wait_value: resources.submitted.saturating_sub(1).max(1),
+            wait_value: resources.submitted.saturating_sub(1),
             signal_value: value,
         },
         None => vibe_frame::SubmitSync::Binary {
@@ -438,6 +613,8 @@ fn main() {
             signal,
         },
     };
+    // Two command buffers: the frame itself, and the present transition, which
+    // is only valid after the render pass has ended.
     let mut batch = vibe_frame::SubmitBatch::single(cmd, sync);
     batch.push(present_cmd);
     let submission = vibe_frame::build_submit_info(&batch);
@@ -461,6 +638,23 @@ fn main() {
         eprintln!("FAIL wait: {e:?}");
         return;
     }
+    // A successful present only proves the driver accepted the work. Reading the
+    // image back proves pixels were actually written.
+    let (lit, total) = read_back(
+        device,
+        &sync2,
+        &logical,
+        graphics_queue,
+        target_image,
+        w,
+        h,
+        [0.02, 0.02, 0.03],
+    );
+    println!("READBACK: {lit} of {total} pixels are not the clear colour");
+    if total > 0 && lit == 0 {
+        eprintln!("WARNING: only one colour in the frame, nothing was drawn");
+    }
+
     let presented =
         match unsafe { swapchain.present(&swapchain_loader, graphics_queue, index, signal) } {
             Ok(p) => p,
@@ -533,4 +727,156 @@ fn make_window() -> Result<(vibe_window::Window, vibe_vk::Entry), String> {
         .and_then(|mut g| g.take())
         .ok_or("no window was created")?;
     Ok((window, entry))
+}
+
+/// The 2D orthographic matrix the camera uniform holds.
+fn renderer_camera_matrix(width: f32, height: f32) -> glam::Mat4 {
+    vibe_math::orthographic_rh(0.0, width, 0.0, height, -1.0, 1.0)
+}
+
+/// Copy the presented image into a host buffer and count the pixels that are not
+/// the clear colour, which is what proves the draw landed rather than merely
+/// being accepted.
+#[allow(clippy::too_many_arguments)]
+fn read_back(
+    device: &ash::Device,
+    sync2: &ash::khr::synchronization2::Device,
+    logical: &vibe_vk::LogicalDevice,
+    queue: ash::vk::Queue,
+    image: ash::vk::Image,
+    width: u32,
+    height: u32,
+    clear: [f32; 3],
+) -> (usize, usize) {
+    use vibe_vk::memory::{BufferUsage, GpuBuffer, MemoryNeed};
+
+    let stride = width as u64 * 4;
+    let size = stride * height as u64;
+
+    let mut buffer = match unsafe {
+        GpuBuffer::create(
+            device,
+            logical.memory_layout(),
+            size,
+            BufferUsage {
+                transfer_dst: true,
+                ..Default::default()
+            },
+            MemoryNeed::upload(),
+        )
+    } {
+        Ok(b) => b,
+        Err(_) => return (0, 0),
+    };
+    if unsafe { buffer.map(device) }.is_err() {
+        return (0, 0);
+    }
+
+    let Ok(pool) = (unsafe {
+        vibe_frame::CommandPool::new(device, logical.graphics_family().unwrap_or(0), 1)
+    }) else {
+        return (0, 0);
+    };
+    let Ok(cmd) = (unsafe { pool.begin(device, 0) }) else {
+        return (0, 0);
+    };
+
+    {
+        // present -> transfer source, so the copy is legal
+        let mut enc = vibe_vk::BarrierEncoder::for_tier(logical.sync_tier());
+        enc.push(
+            vibe_vk::Barrier::image(image, ash::vk::ImageAspectFlags::COLOR)
+                .src(vibe_vk::Stage::None, vibe_vk::Access::None)
+                .dst(vibe_vk::Stage::Transfer, vibe_vk::Access::TransferRead),
+        );
+        unsafe { enc.record(device, sync2, cmd) };
+
+        let region = ash::vk::BufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: ash::vk::ImageSubresourceLayers {
+                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: ash::vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: ash::vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+        };
+        unsafe {
+            device.cmd_copy_image_to_buffer(
+                cmd,
+                image,
+                ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer.buffer(),
+                &[region],
+            );
+        }
+
+        // transfer write -> host read, so the map sees the pixels
+        let mut enc2 = vibe_vk::BarrierEncoder::for_tier(logical.sync_tier());
+        enc2.push(
+            vibe_vk::Barrier::memory_barrier()
+                .src(vibe_vk::Stage::Transfer, vibe_vk::Access::TransferWrite)
+                .dst(vibe_vk::Stage::Host, vibe_vk::Access::HostRead),
+        );
+        unsafe { enc2.record(device, sync2, cmd) };
+    }
+
+    if unsafe { pool.end(device, 0) }.is_err() {
+        return (0, 0);
+    }
+    let batch = vibe_frame::SubmitBatch::single(cmd, vibe_frame::SubmitSync::None);
+    let sub = vibe_frame::build_submit_info(&batch);
+    let Ok(fence) = (unsafe { device.create_fence(&ash::vk::FenceCreateInfo::default(), None) })
+    else {
+        return (0, 0);
+    };
+    if unsafe { sync2.queue_submit2(queue, &[sub.info], fence) }.is_err() {
+        return (0, 0);
+    }
+    if unsafe { device.wait_for_fences(&[fence], true, 10_000_000_000) }.is_err() {
+        return (0, 0);
+    }
+    unsafe { device.destroy_fence(fence, None) };
+
+    let Ok(data) = (unsafe { buffer.read_mapped(0, size as usize) }) else {
+        return (0, 0);
+    };
+
+    // The surface is B8G8R8A8_SRGB, so blue is the first byte. A tolerance is
+    // needed because the clear goes through an sRGB surface.
+    // Write a PPM so the rendered image can actually be looked at.
+    {
+        let path = std::path::Path::new("/tmp/vibe-frame.ppm");
+        let mut ppm = format!("P6\n{} {}\n255\n", width, height).into_bytes();
+        for p in data.chunks_exact(4) {
+            // BGRX -> RGB
+            ppm.extend_from_slice(&[p[2], p[1], p[0]]);
+        }
+        let _ = std::fs::write(path, ppm);
+        println!("  wrote {}", path.display());
+    }
+
+    // A quad can cover pixel 0, so it is not necessarily the background. Use a
+    // histogram: a frame with a clear and several quads must contain more than
+    // one colour, and the most common one is the background.
+    let mut histogram: std::collections::HashMap<[u8; 3], usize> = std::collections::HashMap::new();
+    for p in data.chunks_exact(4) {
+        *histogram.entry([p[2], p[1], p[0]]).or_default() += 1;
+    }
+    let mut ranked: Vec<_> = histogram.into_iter().collect();
+    ranked.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    for (rgb, count) in ranked.iter().take(8) {
+        println!("    rgb {rgb:?} x{count}");
+    }
+    let total = width as usize * height as usize;
+    let dominant = ranked.first().map(|(_, c)| *c).unwrap_or(total);
+    let _ = clear;
+    (total.saturating_sub(dominant), total)
 }

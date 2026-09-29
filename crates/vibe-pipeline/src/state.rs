@@ -21,31 +21,53 @@ pub enum BlendState {
 }
 
 impl BlendState {
-    /// The Vulkan blend factors and operations.
-    pub fn factors(self) -> (vk::BlendFactor, vk::BlendFactor, vk::BlendOp, vk::BlendOp) {
+    /// The colour blend factors and operation.
+    pub fn color_factors(self) -> (vk::BlendFactor, vk::BlendFactor, vk::BlendOp) {
         match self {
             BlendState::Opaque => (
                 vk::BlendFactor::ONE,
                 vk::BlendFactor::ZERO,
-                vk::BlendOp::ADD,
                 vk::BlendOp::ADD,
             ),
             BlendState::AlphaBlend => (
                 vk::BlendFactor::SRC_ALPHA,
                 vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
                 vk::BlendOp::ADD,
-                vk::BlendOp::ADD,
             ),
             BlendState::Additive => (
                 vk::BlendFactor::SRC_ALPHA,
                 vk::BlendFactor::ONE,
-                vk::BlendOp::ADD,
                 vk::BlendOp::ADD,
             ),
             BlendState::Multiply => (
                 vk::BlendFactor::DST_COLOR,
                 vk::BlendFactor::ZERO,
                 vk::BlendOp::ADD,
+            ),
+        }
+    }
+
+    /// The alpha blend factors and operation.
+    ///
+    /// Separate from the colour factors: alpha blending uses `ONE` and
+    /// `ONE_MINUS_SRC_ALPHA`, not `SRC_ALPHA`, so the result alpha is not
+    /// squared away.
+    pub fn alpha_factors(self) -> (vk::BlendFactor, vk::BlendFactor, vk::BlendOp) {
+        match self {
+            BlendState::Opaque => (
+                vk::BlendFactor::ONE,
+                vk::BlendFactor::ZERO,
+                vk::BlendOp::ADD,
+            ),
+            BlendState::AlphaBlend => (
+                vk::BlendFactor::ONE,
+                vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+                vk::BlendOp::ADD,
+            ),
+            BlendState::Additive => (vk::BlendFactor::ONE, vk::BlendFactor::ONE, vk::BlendOp::ADD),
+            BlendState::Multiply => (
+                vk::BlendFactor::ZERO,
+                vk::BlendFactor::ZERO,
                 vk::BlendOp::ADD,
             ),
         }
@@ -448,7 +470,7 @@ mod tests {
 
     #[test]
     fn opaque_blend_replaces_the_target() {
-        let (src, dst, op, _) = BlendState::Opaque.factors();
+        let (src, dst, op) = BlendState::Opaque.color_factors();
         assert_eq!(src, vk::BlendFactor::ONE);
         assert_eq!(dst, vk::BlendFactor::ZERO);
         assert_eq!(op, vk::BlendOp::ADD);
@@ -456,22 +478,43 @@ mod tests {
 
     #[test]
     fn alpha_blend_uses_the_standard_factors() {
-        let (src, dst, _, _) = BlendState::AlphaBlend.factors();
+        let (src, dst, _) = BlendState::AlphaBlend.color_factors();
         assert_eq!(src, vk::BlendFactor::SRC_ALPHA);
         assert_eq!(dst, vk::BlendFactor::ONE_MINUS_SRC_ALPHA);
     }
 
     #[test]
     fn additive_blend_saturates() {
-        let (_, dst, _, _) = BlendState::Additive.factors();
+        let (_, dst, _) = BlendState::Additive.color_factors();
         assert_eq!(dst, vk::BlendFactor::ONE);
     }
 
     #[test]
     fn multiply_blend_scales_by_the_target() {
-        let (src, dst, _, _) = BlendState::Multiply.factors();
+        let (src, dst, _) = BlendState::Multiply.color_factors();
         assert_eq!(src, vk::BlendFactor::DST_COLOR);
         assert_eq!(dst, vk::BlendFactor::ZERO);
+    }
+
+    #[test]
+    fn alpha_factors_differ_from_colour_factors() {
+        // Using SRC_ALPHA for alpha as well as colour squares the alpha, which
+        // fades translucent sprites twice over.
+        let (src_c, _, _) = BlendState::AlphaBlend.color_factors();
+        let (src_a, _, _) = BlendState::AlphaBlend.alpha_factors();
+        assert_eq!(src_c, vk::BlendFactor::SRC_ALPHA);
+        assert_eq!(
+            src_a,
+            vk::BlendFactor::ONE,
+            "alpha must not be premultiplied twice"
+        );
+    }
+
+    #[test]
+    fn additive_keeps_full_alpha() {
+        let (_, _, op) = BlendState::Additive.alpha_factors();
+        assert_eq!(op, vk::BlendOp::ADD);
+        assert_eq!(BlendState::Additive.alpha_factors().0, vk::BlendFactor::ONE);
     }
 
     #[test]

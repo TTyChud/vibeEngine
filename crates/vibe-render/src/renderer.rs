@@ -3,9 +3,10 @@
 use ash::vk;
 use vibe_pipeline::{ColorAttachment, RenderPassDesc};
 use vibe_rhi::{BatchStats, Camera2D};
-use vibe_vk::{Access, Barrier, BarrierEncoder, Stage, image_to_shader_read};
+use vibe_vk::{Access, Barrier, BarrierEncoder, Stage};
 
 use crate::batch::Batcher;
+use crate::bind_group::BindGroup;
 use crate::error::RenderError;
 use crate::pipeline::QuadPipeline;
 
@@ -45,6 +46,12 @@ impl RendererDesc {
 
 /// Draws batched quads into a swapchain image.
 pub struct QuadRenderer {
+    /// The descriptor set, bound before every draw.
+    ///
+    /// Without it the draw is invalid: the shader reads a camera, a texture
+    /// and a sampler, and a draw that leaves any of them unbound faults on some
+    /// drivers rather than returning an error.
+    bind_group: BindGroup,
     pipeline: QuadPipeline,
     batcher: Batcher,
     desc: RendererDesc,
@@ -62,13 +69,19 @@ impl std::fmt::Debug for QuadRenderer {
 
 impl QuadRenderer {
     /// A renderer drawing with a built pipeline.
-    pub fn new(pipeline: QuadPipeline, desc: RendererDesc) -> QuadRenderer {
+    pub fn new(bind_group: BindGroup, pipeline: QuadPipeline, desc: RendererDesc) -> QuadRenderer {
         QuadRenderer {
+            bind_group,
             pipeline,
             batcher: Batcher::default(),
             desc,
             stats: BatchStats::default(),
         }
+    }
+
+    /// The descriptor set this renderer binds before each draw.
+    pub fn bind_group(&self) -> &BindGroup {
+        &self.bind_group
     }
 
     /// The batcher, for adding quads before a frame.
@@ -127,16 +140,18 @@ impl QuadRenderer {
         let viewport = vk::Viewport {
             x: 0.0,
             y: 0.0,
-            width: self.desc.width as f32,
-            height: self.desc.height as f32,
+            width: 4.0,
+            height: 4.0,
             min_depth: 1.0,
             max_depth: 0.0,
         };
+        // TEMP: a 1x1 scissor must clip the draw to one pixel if scissoring
+        // works at all.
         let scissor = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D {
-                width: self.desc.width,
-                height: self.desc.height,
+                width: 300,
+                height: 300,
             },
         };
 
@@ -152,6 +167,15 @@ impl QuadRenderer {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline.pipeline,
             );
+            eprintln!(
+                "  renderer desc {}x{} viewport {}x{} scissor {}x{}",
+                self.desc.width,
+                self.desc.height,
+                viewport.width,
+                viewport.height,
+                scissor.extent.width,
+                scissor.extent.height
+            );
             device.cmd_set_viewport(command_buffer, 0, &[viewport]);
             device.cmd_set_scissor(command_buffer, 0, &[scissor]);
             device.cmd_set_primitive_topology(command_buffer, vk::PrimitiveTopology::TRIANGLE_LIST);
@@ -159,18 +183,18 @@ impl QuadRenderer {
             // 2D quads have no depth buffer, so the depth test is off.
             device.cmd_set_depth_test_enable(command_buffer, false);
 
-            // The camera is a single mat4 in push constants: no descriptor, no
-            // rebind, and it is the only per-frame data the shader needs.
-            let matrix = self.desc.camera.view_projection;
-            device.cmd_push_constants(
-                command_buffer,
-                self.pipeline.layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                bytemuck::bytes_of(&matrix),
-            );
-
-            if !self.batcher.is_empty() && std::env::var("VIBE_SKIP_DRAW").is_err() {
+            if !self.batcher.is_empty() {
+                // The set must be bound before the draw, not after: the driver
+                // validates descriptor state as the command is recorded, and an
+                // unbound draw faults rather than returning an error.
+                device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline.layout,
+                    0,
+                    &[self.bind_group.set()],
+                    &[],
+                );
                 device.cmd_bind_vertex_buffers(command_buffer, 0, &[vertex_buffer], &[offset]);
                 device.cmd_draw(command_buffer, self.batcher.vertex_count() as u32, 1, 0, 0);
             }
@@ -188,10 +212,13 @@ impl QuadRenderer {
     /// render pass has ended.
     pub fn frame_barriers(&self, target: vk::Image) -> [Barrier; 2] {
         [
+            // undefined -> colour attachment, before the pass
             Barrier::image(target, vk::ImageAspectFlags::COLOR)
                 .src(Stage::None, Access::None)
                 .dst(Stage::ColorAttachmentOutput, Access::ColorAttachmentWrite),
-            image_to_shader_read(target, vk::ImageAspectFlags::COLOR)
+            // colour attachment -> present, after the pass. A swapchain image
+            // must end in PRESENT_SRC_KHR or vkQueuePresentKHR is invalid.
+            Barrier::image(target, vk::ImageAspectFlags::COLOR)
                 .src(Stage::ColorAttachmentOutput, Access::ColorAttachmentWrite)
                 .dst(Stage::None, Access::None),
         ]
@@ -267,8 +294,10 @@ mod tests {
 
     #[test]
     fn the_post_pass_barrier_leaves_the_attachment_layout() {
+        // A swapchain image must end in PRESENT_SRC_KHR, not a shader layout,
+        // so the second barrier is a plain memory transition.
         let image = vk::Image::from_raw(0x1234);
-        let post = image_to_shader_read(image, vk::ImageAspectFlags::COLOR)
+        let post = Barrier::image(image, vk::ImageAspectFlags::COLOR)
             .src(Stage::ColorAttachmentOutput, Access::ColorAttachmentWrite)
             .dst(Stage::None, Access::None);
         assert_eq!(post.src_stage, Stage::ColorAttachmentOutput);

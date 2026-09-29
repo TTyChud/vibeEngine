@@ -8,6 +8,7 @@ members = [
     "crates/vibe-ecs",
     "crates/vibe-graph",
     "crates/vibe-scene",
+    "crates/vibe-physics",
 ]
 
 [workspace.package]
@@ -25,6 +26,7 @@ vibe-rhi = { path = "crates/vibe-rhi" }
 vibe-vk = { path = "crates/vibe-vk" }
 vibe-graph = { path = "crates/vibe-graph" }
 vibe-scene = { path = "crates/vibe-scene" }
+vibe-physics = { path = "crates/vibe-physics" }
 
 ash = "0.38"
 serde = { version = "1", features = ["derive"] }

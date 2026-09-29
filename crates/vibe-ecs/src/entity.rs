@@ -21,7 +21,11 @@ impl Entity {
         }
     }
 
-    pub(crate) const fn from_parts(index: u32, generation: u32) -> Entity {
+    /// Build a handle from its parts.
+    ///
+    /// Public so test and tooling code outside the crate can construct one; the
+    /// world itself is what mints live handles.
+    pub const fn from_parts(index: u32, generation: u32) -> Entity {
         Entity { index, generation }
     }
 

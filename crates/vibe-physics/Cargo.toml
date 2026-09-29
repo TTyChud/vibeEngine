@@ -1,0 +1,18 @@
+[package]
+name = "vibe-physics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "2D and 3D rigid body physics for vibeEngine"
+
+[dependencies]
+glam.workspace = true
+thiserror.workspace = true
+vibe-ecs.workspace = true
+rapier2d = "0.36"
+rapier3d = "0.36"
+
+[lints.rust]
+unsafe_code = "forbid"

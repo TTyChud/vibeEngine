@@ -73,7 +73,22 @@ Still to do for the milestone to be usable on the GPU: the executor's
 `ResourceResolver` needs a Vulkan implementation, and the barriers need
 translating into the tier-gated encoder.
 
-## Milestone 4 — Physics
+## Milestone 4 — Physics (DONE, `vibe-physics`)
+
+Backed by **Rapier** (`rapier2d` 0.36, `rapier3d` 0.36), the Rust-native
+equivalent of Box2D and Jolt.
+
+- `Physics2D`: world create/step/destroy, static/kinematic/dynamic bodies,
+  box colliders with density, friction and restitution, gravity scale, linear
+  and angular damping, optional rotation, velocity and impulse control
+- `Physics3D`: box, sphere and capsule colliders, per-axis linear and angular
+  DOF locks, sensors, mass derived from volume and density
+- ECS bridge: bodies are built from `Rigidbody2D`/`Rigidbody3D` plus the matching
+  collider component, and their transforms are written back after each step
+- A generation-tagged handle registry, so a body slot reused after a rebuild
+  cannot be addressed by a stale handle
+- `prune` drops bodies whose entity despawned, which is the case that breaks
+  naive implementations
 
 Rust crates, not C++:
 
@@ -162,6 +177,15 @@ them, and it is already wired into `PhysicalDeviceInfo`.
   `cargo test -p vibe-vk` once device enumeration is live.
 - No `vulkaninfo` installed; the `probe` example covers the same ground in Rust
   and is the check to use.
+- Rapier 0.36 replaced the old `RigidBodySet`/`ColliderSet` pipeline with a
+  unified `PhysicsWorld`. Bodies are reached through its public `bodies` /
+  `colliders` fields, not accessor methods. Shape constructors are on
+  `ColliderBuilder`, and its setters are fluent (`.density(x)`, not
+  `.set_density(x)`). `Pose3::new` takes a translation plus an **axis-angle**,
+  not a quaternion, and `Rotation` is glam's own `Quat`. The 2D `AngVector` is
+  the bare scalar. The prelude re-exports glam types, so globbing it next to
+  this engine's own `glam` imports makes every shared name ambiguous; import
+  rapier's types by name.
 - glam 0.33 moved its camera helpers into `glam::camera::*`, and its
   `vulkan::orthographic` inverts Y and yields negative depth for a 2D camera, so
   `vibe-math` builds the orthographic matrix by hand. Its `perspective_infinite_reverse`

@@ -10,6 +10,7 @@ members = [
     "crates/vibe-scene",
     "crates/vibe-physics",
     "crates/vibe-shader",
+    "crates/vibe-pipeline",
 ]
 
 [workspace.package]
@@ -26,6 +27,8 @@ vibe-ecs = { path = "crates/vibe-ecs" }
 vibe-rhi = { path = "crates/vibe-rhi" }
 vibe-vk = { path = "crates/vibe-vk" }
 vibe-graph = { path = "crates/vibe-graph" }
+vibe-pipeline = { path = "crates/vibe-pipeline" }
+vibe-shader = { path = "crates/vibe-shader" }
 vibe-scene = { path = "crates/vibe-scene" }
 vibe-physics = { path = "crates/vibe-physics" }
 

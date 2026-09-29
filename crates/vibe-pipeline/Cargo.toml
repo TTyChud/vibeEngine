@@ -1,0 +1,18 @@
+[package]
+name = "vibe-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Graphics pipeline and vertex layout for vibeEngine"
+
+[dependencies]
+ash.workspace = true
+log.workspace = true
+thiserror.workspace = true
+vibe-rhi.workspace = true
+vibe-shader.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"

@@ -62,8 +62,22 @@ Fourth pass:
   - Output externally verified: the built-in quad and cull shaders pass the
     system's own `spirv-val`, not just this crate's magic-number check
 
-Not yet built: command buffers, graphics pipelines, windowing, the editor,
-audio, mesh loading. Those come next.
+Fifth pass:
+
+- **Graphics pipeline descriptions** in `vibe-pipeline`: blend, depth,
+  primitive, raster and multisample state as plain data, so a pipeline can be
+  described, compared and hashed with no device present.
+- A **cache key** per description. Two descriptions with the same key produce an
+  identical pipeline, so a cache can skip the driver call entirely — the same
+  idea Unreal's PSO cache uses.
+- The **quad vertex layout**, cross-checked against `vibe_rhi::QuadVertex` in a
+  test. A drift between the two is the classic cause of "my sprite is garbage",
+  and it produces no error anywhere, so it is worth a test that fails loudly.
+- **Dynamic rendering** descriptions: colour and depth attachments with their
+  load/store ops and clear values, plus a reverse-Z viewport.
+
+Not yet built: command buffers, windowing, the editor, audio, mesh loading.
+Those come next.
 
 The render graph (milestone 3) and scene serialization (milestone 5) were built
 ahead of the GPU work, because both are pure logic and testable without a
@@ -216,6 +230,15 @@ them, and it is already wired into `PhysicalDeviceInfo`.
   `cargo test -p vibe-vk` once device enumeration is live.
 - No `vulkaninfo` installed; the `probe` example covers the same ground in Rust
   and is the check to use.
+- ash 0.38 targets Vulkan 1.3, so several 1.0 fields are **gone** rather than
+  deprecated: `PipelineRasterizationStateCreateInfo` has no `depth_clip_enable`
+  or `depth_bounds_enable` (both are now always on), and
+  `RenderingAttachmentInfo` has no `image_array_layer` and takes
+  `ResolveModeFlags` (a bitflag, not an enum). `ClearValue` is a C **union**
+  with `color` and `depth_stencil` fields, not an enum of Float/Color variants,
+  and has no `Debug`. `CullModeFlags` constants are `BACK` and `FRONT`, without
+  the `_BIT` suffix. `CompareOp` and `SampleCountFlags` are ash types, so they
+  have no `to_le_bytes`; use `as_raw()`.
 - naga 30's SPIR-V entry point is `spv::write_vec(module, &info, &options,
   pipeline_options)`, and `spv::Options` has a `Default` impl, so build from
   that and override rather than filling every field. `ModuleInfo`'s fields are

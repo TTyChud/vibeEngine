@@ -50,8 +50,20 @@ Third pass, also device-independent:
   creation, mapping, and bounds-checked mapped reads and writes.
 - A surface probe example, verified against this machine's real driver.
 
-Not yet built: command buffers, pipelines, shader compilation, windowing, the
-editor, audio, mesh loading. Those come next.
+Fourth pass:
+
+- **WGSL to SPIR-V via naga**, in `vibe-shader`. Pure Rust, so the engine
+  compiles its own shaders with no C++ toolchain and no external binary. This is
+  what Slang would have provided, done natively.
+  - Per-entry-point compilation, so a pipeline draws its vertex and fragment
+    stages out of one module
+  - A `ShaderLibrary` cache keyed by name, stage *and* options, so changing the
+    debug flags invalidates rather than returning a stale module
+  - Output externally verified: the built-in quad and cull shaders pass the
+    system's own `spirv-val`, not just this crate's magic-number check
+
+Not yet built: command buffers, graphics pipelines, windowing, the editor,
+audio, mesh loading. Those come next.
 
 The render graph (milestone 3) and scene serialization (milestone 5) were built
 ahead of the GPU work, because both are pure logic and testable without a
@@ -204,6 +216,17 @@ them, and it is already wired into `PhysicalDeviceInfo`.
   `cargo test -p vibe-vk` once device enumeration is live.
 - No `vulkaninfo` installed; the `probe` example covers the same ground in Rust
   and is the check to use.
+- naga 30's SPIR-V entry point is `spv::write_vec(module, &info, &options,
+  pipeline_options)`, and `spv::Options` has a `Default` impl, so build from
+  that and override rather than filling every field. `ModuleInfo`'s fields are
+  private and are only reachable through the validator, not read back.
+  `fake_missing_bindings` must be `true` unless a real binding map is supplied,
+  and `true` is what the engine wants anyway: bindings carry over from the WGSL
+  declarations unchanged. `DebugInfo` borrows its source, so options hold owned
+  text. `SourceLanguage` comes from the `spirv` crate and the WGSL variant is
+  spelled `WGSL`; that enum also has a `Slang` variant, so naga already tracks
+  Slang as a source language if it is ever wanted.
+- WGSL reserves `sampler`, so a texture sampler variable cannot be named that.
 - Rapier 0.36 replaced the old `RigidBodySet`/`ColliderSet` pipeline with a
   unified `PhysicsWorld`. Bodies are reached through its public `bodies` /
   `colliders` fields, not accessor methods. Shape constructors are on

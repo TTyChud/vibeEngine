@@ -1,0 +1,16 @@
+[package]
+name = "vibe-shader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "WGSL to SPIR-V compilation for vibeEngine"
+
+[dependencies]
+log.workspace = true
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -9,6 +9,7 @@ members = [
     "crates/vibe-graph",
     "crates/vibe-scene",
     "crates/vibe-physics",
+    "crates/vibe-shader",
 ]
 
 [workspace.package]

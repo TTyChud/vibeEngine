@@ -30,7 +30,10 @@ impl ColorAttachment {
     pub fn new(view: vk::ImageView) -> ColorAttachment {
         ColorAttachment {
             view,
-            base_layout: vk::ImageLayout::UNDEFINED,
+            // Matches the layout the pre-pass barrier leaves the image in.
+            // Claiming UNDEFINED here while the barrier produced
+            // COLOR_ATTACHMENT_OPTIMAL makes the two disagree.
+            base_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
             blend: BlendState::Opaque,
             clear: None,
@@ -322,9 +325,23 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_colour_attachment_discards_its_contents() {
+    fn a_colour_attachment_starts_in_the_colour_attachment_layout() {
+        // The base layout must match what the pre-pass barrier leaves behind.
+        // Claiming UNDEFINED here while the barrier produced
+        // COLOR_ATTACHMENT_OPTIMAL makes the two disagree, and the driver
+        // rejects the pass.
         assert_eq!(
             ColorAttachment::new(view(1)).base_layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        );
+    }
+
+    #[test]
+    fn discarding_returns_the_attachment_to_undefined() {
+        // A pass that really does discard its input starts from UNDEFINED and
+        // needs no pre-pass transition.
+        assert_eq!(
+            ColorAttachment::new(view(1)).discarding().base_layout,
             vk::ImageLayout::UNDEFINED
         );
     }

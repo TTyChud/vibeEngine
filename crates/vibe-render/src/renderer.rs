@@ -140,8 +140,8 @@ impl QuadRenderer {
         let viewport = vk::Viewport {
             x: 0.0,
             y: 0.0,
-            width: 4.0,
-            height: 4.0,
+            width: self.desc.width as f32,
+            height: self.desc.height as f32,
             min_depth: 1.0,
             max_depth: 0.0,
         };
@@ -150,8 +150,8 @@ impl QuadRenderer {
         let scissor = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D {
-                width: 300,
-                height: 300,
+                width: self.desc.width,
+                height: self.desc.height,
             },
         };
 
@@ -166,15 +166,6 @@ impl QuadRenderer {
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline.pipeline,
-            );
-            eprintln!(
-                "  renderer desc {}x{} viewport {}x{} scissor {}x{}",
-                self.desc.width,
-                self.desc.height,
-                viewport.width,
-                viewport.height,
-                scissor.extent.width,
-                scissor.extent.height
             );
             device.cmd_set_viewport(command_buffer, 0, &[viewport]);
             device.cmd_set_scissor(command_buffer, 0, &[scissor]);

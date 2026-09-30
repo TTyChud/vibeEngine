@@ -17,6 +17,14 @@ use vibe_window::{SurfaceKind, surface};
 const TIMEOUT: u64 = 10_000_000_000;
 
 fn main() {
+    // Validation has to be requested before the instance exists, because the
+    // loader reads the layer list when it creates one.
+    let validating = std::env::var("VIBE_VALIDATION").is_ok();
+    if validating {
+        vibe_vk::validation::enable_layer();
+        eprintln!("validation layer requested");
+    }
+
     // 1. Vulkan loader and a window; the helper loads the entry table itself
     let (window, entry) = match make_window() {
         Ok(v) => v,
@@ -52,6 +60,21 @@ fn main() {
                 return;
             }
         };
+
+    // A messenger, held for the run, is what actually prints the layer's
+    // findings: enabling the layer alone installs the checks but routes their
+    // output through this callback.
+    let _messenger = if validating {
+        match unsafe { vibe_vk::validation::ValidationMessenger::new(&entry.ash, &instance) } {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("could not create a validation messenger: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // 3. Surface
     let (vk_surface, _) = match unsafe { surface::create_surface(&entry.ash, &instance, raw) } {
@@ -201,7 +224,9 @@ fn main() {
     };
 
     // 5. The pipeline, compiled from WGSL at runtime
-    let pipeline = match unsafe { vibe_render::build_quad_pipeline(device, &WgslCompiler::new()) } {
+    let pipeline = match unsafe {
+        vibe_render::build_quad_pipeline(device, &WgslCompiler::new(), &[swapchain.format().format])
+    } {
         Ok(p) => p,
         Err(e) => {
             eprintln!("FAIL pipeline: {e}");
@@ -533,18 +558,6 @@ fn main() {
                 vibe_vk::Access::ColorAttachmentWrite,
             ),
     );
-    // One barrier before the pass: the image goes from undefined to a colour
-    // attachment. The transition back to present must come after the pass, and
-    // lives in the second command buffer below.
-    let mut encoder = vibe_vk::BarrierEncoder::for_tier(logical.sync_tier());
-    encoder.push(
-        vibe_vk::Barrier::image(target_image, vk::ImageAspectFlags::COLOR)
-            .src(vibe_vk::Stage::None, vibe_vk::Access::None)
-            .dst(
-                vibe_vk::Stage::ColorAttachmentOutput,
-                vibe_vk::Access::ColorAttachmentWrite,
-            ),
-    );
     eprintln!("  barrier: calling record");
     unsafe { encoder.record(device, &sync2, cmd) };
     eprintln!("  barrier: returned");
@@ -599,14 +612,12 @@ fn main() {
     // timeline path handles the steady state by waiting on the previous frame's
     // value and signalling the next.
     let sync = match resources.timeline_semaphore() {
-        // On the timeline path the acquire raised the timeline to the frame's
-        // own value, so waiting for the previous frame's value covers the
-        // acquire too: on frame one that is 0, which the acquire has already
-        // passed, so the wait does not block.
+        // The acquire signalled this frame's own value, so the frame waits for
+        // that value: that is the "image is ready to render into" signal.
         Some(sem) => vibe_frame::SubmitSync::Timeline {
             semaphore: sem,
-            wait_value: resources.submitted.saturating_sub(1),
-            signal_value: value,
+            wait_value: value,
+            signal_value: value + 1,
         },
         None => vibe_frame::SubmitSync::Binary {
             wait: signal,

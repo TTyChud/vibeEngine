@@ -250,11 +250,21 @@ pub unsafe fn create_instance_with_version(
     let available = unsafe { entry.enumerate_instance_extension_properties(None) }?;
     let available_names: Vec<&CStr> = available.iter().map(ext_name).collect();
 
+    // Validation needs VK_EXT_debug_utils, requested only when the caller
+    // asked for it so a normal run carries no extra extension.
+    let mut wanted: Vec<*const c_char> = surface_extensions.iter().copied().collect();
+    if crate::validation::validation_requested() {
+        if let Some(ext) = crate::validation::required_extension() {
+            wanted.push(ext.as_ptr());
+        }
+    }
+
     let mut extensions: Vec<*const c_char> = Vec::new();
-    for want in surface_extensions {
-        let name = unsafe { CStr::from_ptr(*want) };
+    for want in wanted {
+        // `want` is already the pointer, not a pointer to one.
+        let name = unsafe { CStr::from_ptr(want) };
         if available_names.contains(&name) {
-            extensions.push(*want);
+            extensions.push(want);
         } else {
             warn!(
                 "instance extension {} unavailable, continuing without it",

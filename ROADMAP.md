@@ -165,7 +165,41 @@ Eighth pass — the frame renders:
 3. **A zero-size push constant range is a validation error**, so the range is
    now declared only when the pipeline actually uses one.
 
-Not yet built: the editor, audio, mesh loading. Those come next.
+Ninth pass — the validation layer, and what it found.
+
+`vulkan-validation-layers` is installed. `vibe-vk::validation` enables
+`VK_LAYER_KHRONOS_validation` and creates a debug messenger when `VIBE_VALIDATION=1`
+is set, so a developer build gets the driver to explain itself. Run any example
+with that variable to see the layer's output.
+
+It immediately named four faults that inference had not:
+
+1. **The Vulkan 1.2 and 1.3 features were never enabled.** They were being
+   written into `p_enabled_features`, which is a 1.0 struct and silently
+   ignores fields it does not know. `dynamic_rendering`, `synchronization2` and
+   `timeline_semaphore` must be chained through `pNext` as
+   `PhysicalDeviceVulkan12Features` and `PhysicalDeviceVulkan13Features`. With
+   them off, the driver ignored the dynamic viewport entirely and rasterised
+   into its default, which is why a full-screen quad produced one pixel. This is
+   the root cause the readback could only show as a symptom.
+2. **The pipeline declared no `PipelineRenderingCreateInfo`.** Dynamic rendering
+   has no render pass object to carry the attachment formats, so the pipeline
+   must declare `p_color_attachment_formats` itself.
+3. **The dynamic state was incomplete.** The renderer sets cull mode, topology
+   and depth-test per frame, so all three must be listed as dynamic states, and
+   a dynamic scissor needs `scissor_count` to match `viewport_count`.
+4. **The colour attachment's base layout disagreed with the barrier.** The pass
+   claimed `UNDEFINED` while the pre-pass barrier produced
+   `COLOR_ATTACHMENT_OPTIMAL`. The attachment now defaults to the layout the
+   barrier leaves behind, and `discarding()` opts back into `UNDEFINED`.
+
+All pipeline-creation errors are now gone. Three remain, all in the swapchain
+and upload paths rather than the pipeline: a texture upload that transitions
+from the wrong source layout, a readback that needs `TRANSFER_SRC` the image
+lacks, and the acquire's semaphore type. Each is a real bug with a known fix.
+
+Not yet built: the editor, glTF, skeletal animation, MSDF text. Those come
+next.
 
 The render graph (milestone 3) and scene serialization (milestone 5) were built
 ahead of the GPU work, because both are pure logic and testable without a

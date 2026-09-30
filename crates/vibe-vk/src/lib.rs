@@ -12,6 +12,7 @@ pub mod graph_bridge;
 pub mod memory;
 pub mod swapchain;
 pub mod sync;
+pub mod validation;
 
 pub use barrier::{
     Access, Barrier, BarrierEncoder, ResourceKind, Stage, image_to_shader_read, upload_barriers,

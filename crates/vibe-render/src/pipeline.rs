@@ -133,6 +133,7 @@ impl<C: ShaderCompiler> ShaderCompiler for EntryPointCompiler<'_, C> {
 pub unsafe fn build_quad_pipeline<C: ShaderCompiler>(
     device: &ash::Device,
     compiler: &C,
+    target_formats: &[vk::Format],
 ) -> Result<QuadPipeline, RenderError> {
     use vibe_shader::CompileOptions;
 
@@ -247,6 +248,9 @@ pub unsafe fn build_quad_pipeline<C: ShaderCompiler>(
             },
         ];
 
+        // The formats the pipeline renders to. Filled by the caller, because
+        // the target's format is not known when the description is built.
+        let target_formats: Vec<vk::Format> = target_formats.to_vec();
         let attributes = desc.layout.attribute_descriptions();
         let binding = desc.layout.binding_description();
         let vertex_input = vk::PipelineVertexInputStateCreateInfo {
@@ -267,7 +271,16 @@ pub unsafe fn build_quad_pipeline<C: ShaderCompiler>(
         // frame, and a missing set is a command-buffer recording error rather
         // than a silent one-pixel raster.
         // Bound to a local: the create info holds a pointer into it.
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        // The renderer sets all of these per frame, so each must be declared
+        // dynamic or the driver rejects the pipeline. SCISSOR is dynamic and
+        // implies a count of one, matching viewport_count.
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::CULL_MODE,
+            vk::DynamicState::PRIMITIVE_TOPOLOGY,
+            vk::DynamicState::DEPTH_TEST_ENABLE,
+        ];
         let dynamic = vk::PipelineDynamicStateCreateInfo {
             dynamic_state_count: dynamic_states.len() as u32,
             p_dynamic_states: dynamic_states.as_ptr(),
@@ -275,6 +288,9 @@ pub unsafe fn build_quad_pipeline<C: ShaderCompiler>(
         };
         let viewport_state = vk::PipelineViewportStateCreateInfo {
             viewport_count: 1,
+            // A dynamic scissor still needs the count to agree with the
+            // viewport count, even though the rectangle itself is set later.
+            scissor_count: 1,
             ..Default::default()
         };
         let rasterization = desc.raster.vk();
@@ -313,8 +329,16 @@ pub unsafe fn build_quad_pipeline<C: ShaderCompiler>(
             ..Default::default()
         };
 
+        // Dynamic rendering needs the attachment formats declared here, since
+        // there is no render pass object to carry them.
+        let rendering = vk::PipelineRenderingCreateInfo {
+            color_attachment_count: desc.color_attachment_count,
+            p_color_attachment_formats: target_formats.as_ptr(),
+            ..Default::default()
+        };
         let create_info = vk::GraphicsPipelineCreateInfo {
             stage_count: stages.len() as u32,
+            p_next: &rendering as *const _ as *const _,
             p_stages: stages.as_ptr(),
             p_vertex_input_state: &vertex_input,
             p_input_assembly_state: &input_assembly,

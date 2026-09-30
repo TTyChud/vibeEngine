@@ -272,6 +272,38 @@ impl LogicalDevice {
         let available_refs: Vec<&str> = available.iter().map(|s| s.as_str()).collect();
         let enabled = choose_extensions(choice.info.sync_tier, &available_refs);
 
+        // The 1.2 and 1.3 features the engine needs, queried before they are
+        // enabled: asking for a feature the device lacks makes
+        // vkCreateDevice fail outright.
+        let mut supported12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut supported13 = vk::PhysicalDeviceVulkan13Features::default();
+        {
+            let mut features2 = vk::PhysicalDeviceFeatures2::default();
+            // SAFETY: the three structs outlive the call, which only writes
+            // through them.
+            unsafe {
+                features2.p_next = &mut supported12 as *mut _ as *mut _;
+                supported12.p_next = &mut supported13 as *mut _ as *mut _;
+                instance.get_physical_device_features2(physical_device, &mut features2);
+            }
+        }
+        let want_timeline = supported12.timeline_semaphore == vk::TRUE;
+        let want_sync2 = supported13.synchronization2 == vk::TRUE;
+        let want_dynamic_rendering = supported13.dynamic_rendering == vk::TRUE;
+        log::info!(
+            "device features: timeline={want_timeline} synchronization2={want_sync2} \
+             dynamic_rendering={want_dynamic_rendering}"
+        );
+
+        // Without these the driver ignores the dynamic viewport and falls back
+        // to a one-pixel default, which is a silent failure rather than an
+        // error, so they are required rather than optional.
+        if !want_dynamic_rendering {
+            return Err(VkError::Swapchain(
+                "the device does not support dynamic rendering".to_string(),
+            ));
+        }
+
         let families = choice.queue_families();
         if families.is_empty() {
             return Err(VkError::MissingQueueFamily { what: "any" });
@@ -296,12 +328,34 @@ impl LogicalDevice {
         for name in &extension_names {
             debug!("enabling device extension {:?}", name.to_string_lossy());
         }
+        // The 1.2 and 1.3 features cannot go in `p_enabled_features`, which is a
+        // 1.0 struct: it silently ignores fields it does not know, so a
+        // pipeline built without them still "works" but rasterises one pixel.
+        // They must be chained through pNext.
+        // The chain has to be built in order: 1.2 points at 1.3, and the
+        // create info points at 1.2. Setting a link after the parent has taken
+        // its address would be a use-after-move.
+        let mut features13 = vk::PhysicalDeviceVulkan13Features {
+            synchronization2: if want_sync2 { vk::TRUE } else { vk::FALSE },
+            dynamic_rendering: if want_dynamic_rendering {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
+            ..Default::default()
+        };
+        let mut features12 = vk::PhysicalDeviceVulkan12Features {
+            timeline_semaphore: if want_timeline { vk::TRUE } else { vk::FALSE },
+            ..Default::default()
+        };
+        features12.p_next = &mut features13 as *mut _ as *mut _;
         let create_info = vk::DeviceCreateInfo {
             queue_create_info_count: queue_infos.len() as u32,
             p_queue_create_infos: queue_infos.as_ptr(),
             enabled_extension_count: extension_ptrs.len() as u32,
             pp_enabled_extension_names: extension_ptrs.as_ptr(),
             p_enabled_features: &enabled.features,
+            p_next: &features12 as *const _ as *const _,
             ..Default::default()
         };
 

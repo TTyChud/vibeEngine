@@ -19,12 +19,22 @@ use std::ffi::CStr;
 
 use ash::vk;
 use vibe_editor::{Editor, FontAtlas, Panel, UiDrawData};
+use vibe_render::bind_group::create_sampler;
+use vibe_render::mesh3d::{CameraUniform, build_mesh_pipeline};
 use vibe_render::ui::{ScreenTransform, UiBindGroup, build_ui_pipeline, scissor_from_bounds};
 use vibe_vk::memory::{BufferUsage, GpuBuffer, GpuImage, HeapLayout, ImageUsage, MemoryNeed};
 use vibe_window::{SurfaceKind, surface};
 
 /// How long to wait for the GPU, in nanoseconds.
 const TIMEOUT: u64 = 10_000_000_000;
+
+/// The depth attachment's format.
+///
+/// Taken from the mesh pipeline rather than declared here, because the pipeline
+/// bakes the format into its `PipelineRenderingCreateInfo` and a second
+/// declaration is free to disagree with it — which is a validation error at the
+/// draw with nothing else to point at the cause.
+const DEPTH_FORMAT: vk::Format = vibe_render::mesh3d::DEPTH_FORMAT;
 
 /// The background the panels sit over, in linear colour.
 const BACKDROP: [f32; 4] = [40.0 / 255.0, 44.0 / 255.0, 52.0 / 255.0, 1.0];
@@ -61,11 +71,37 @@ fn main() {
     let _ = (CStr::from_bytes_with_nul(b"x\0"), SurfaceKind::Wayland);
 }
 
+/// The first PNG or JPEG directly inside `dir`, sorted by name.
+///
+/// Sorted so the choice is the same on every run: an unsorted `read_dir` makes
+/// the starting texture depend on the filesystem's hash order, which is not
+/// something a screenshot diff can rely on.
+fn find_texture(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && vibe_render::texture::is_supported(p))
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
 /// What `setup` hands back to the caller.
 struct Setup {
     gpu: Gpu,
     messenger: Option<vibe_vk::validation::ValidationMessenger>,
     surface: vk::SurfaceKHR,
+    /// The loader's entry table and the instance, kept for the run.
+    ///
+    /// `ash::Device` holds function pointers into what `ash::Instance` loaded
+    /// through `ash::Entry`, and both of those live in loader-allocated memory.
+    /// Letting either drop when `setup` returns frees that memory while the
+    /// frame loop still calls through it, so the next Vulkan entry point jumps
+    /// to a stale address. This is why the editor crashes in `vkCreateImage` on
+    /// its first real frame and not during setup, where the same calls succeed.
+    entry: vibe_vk::Entry,
+    instance: ash::Instance,
 }
 
 /// Everything a redraw needs, created once and kept.
@@ -117,6 +153,57 @@ struct Gpu {
     atlas_staging: GpuBuffer,
     /// The atlas currently on the GPU, so an unchanged one is not re-uploaded.
     uploaded_atlas: FontAtlas,
+    /// The 3D pipeline, over the same target as the UI.
+    mesh_pipeline: vibe_render::mesh3d::MeshPipeline,
+    /// The camera uniform the mesh shader reads.
+    ///
+    /// Never read on the CPU: its whole contents go to the GPU each frame, and
+    /// the buffer has to outlive every descriptor set naming it.
+    #[allow(dead_code)]
+    camera_buffer: GpuBuffer,
+    /// The depth attachment, sized to the window and rebuilt on a resize.
+    depth: Option<GpuImage>,
+    /// A 1x1 white texture, bound by every box that has no texture of its own.
+    white_texture: GpuImage,
+    /// A linear, clamped sampler for the box textures.
+    ///
+    /// Linear because a texture is magnified from whatever resolution the user
+    /// loaded; clamped so a UV at the very edge of a texture does not wrap
+    /// around to the opposite side.
+    texture_sampler: vk::Sampler,
+    /// The per-box GPU state, keyed by the box's index in `Editor::boxes`.
+    ///
+    /// A `Vec` indexed the same way as the scene rather than a map keyed by
+    /// entity: the renderer walks the boxes in order every frame, and an index
+    /// keeps the vertex buffer, the texture and the scene entry in step without
+    /// a lookup per box per frame.
+    mesh_boxes: Vec<MeshBox>,
+    /// A pool of its own for texture uploads.
+    ///
+    /// Separate for the same reason as `atlas_pool`: the upload happens while
+    /// the frame's pools have buffers in the recording state, and opening a
+    /// second buffer in a pool that still has one open segfaults on this driver.
+    texture_pool: vibe_frame::CommandPool,
+}
+
+/// One box's GPU state: the geometry uploaded, and the texture bound to it.
+struct MeshBox {
+    /// The vertices staged and uploaded, rebuilt when the box's size changes.
+    vertex_buffer: GpuBuffer,
+    /// How many vertices the buffer holds.
+    vertex_count: u32,
+    /// The size the vertices were built for, so a resize is detected.
+    built_size: glam::Vec3,
+    /// The position the vertices were built at.
+    built_position: glam::Vec3,
+    /// The albedo texture, and the path it came from.
+    ///
+    /// The path is kept so an unchanged texture is not re-decoded and
+    /// re-uploaded every frame, which for a 4K JPEG is a visible stall.
+    texture: Option<GpuImage>,
+    texture_path: Option<std::path::PathBuf>,
+    /// The descriptor set naming the camera and this box's texture.
+    bind_group: vibe_render::mesh3d::MeshBindGroup,
 }
 
 /// The running editor.
@@ -134,6 +221,15 @@ struct App {
     /// True once the first frame has been read back, which stalls the pipeline
     /// and is only worth doing once.
     readback_done: bool,
+    /// The loader entry table and the instance, kept for the whole run.
+    ///
+    /// `ash::Device` is a table of function pointers into what `ash::Instance`
+    /// loaded through `ash::Entry`; both live in loader-allocated memory. These
+    /// are the last two fields on purpose: Rust drops fields in declaration
+    /// order, so the device and surface in `gpu` go first and nothing calls
+    /// through a freed dispatch table on the way out.
+    _entry: Option<vibe_vk::Entry>,
+    _instance: Option<ash::Instance>,
 }
 
 impl App {
@@ -143,7 +239,45 @@ impl App {
         for name in ["Player", "Enemy", "Camera"] {
             editor.spawn(name);
         }
-        editor.content.root = std::env::temp_dir();
+        // Three boxes, so the 3D pass has something to draw on the very first
+        // frame rather than a scene the user has to populate first. The second
+        // one is deliberately a different size: three identical boxes make it
+        // impossible to tell from a screenshot whether the resize path works.
+        for (name, size) in [
+            ("Box", glam::Vec3::splat(1.0)),
+            ("Box", glam::Vec3::new(1.6, 0.8, 1.0)),
+            ("Box", glam::Vec3::splat(0.6)),
+        ] {
+            let e = editor.spawn_box(name);
+            if let Some(b) = editor.boxes.get_mut(e) {
+                b.size = size;
+            }
+            editor.boxes.sync_transform(e, &mut editor.world);
+        }
+        // A starting texture, so the scene opens with one box textured and two
+        // not — which is the only way to see the difference in a screenshot.
+        //
+        // `VIBE_TEXTURE` wins, then a file called `vibe-checker.png` (the test
+        // fixture), and only then the first image in the temp directory. Picking
+        // the alphabetically-first image instead means a screenshot the user
+        // happened to leave in `/tmp` becomes the box's albedo, which is a
+        // confusing way to discover that texturing works.
+        let root = std::env::temp_dir();
+        let starting_texture = std::env::var_os("VIBE_TEXTURE")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+            .or_else(|| {
+                let named = root.join("vibe-checker.png");
+                named.exists().then_some(named)
+            })
+            .or_else(|| find_texture(&root))
+            .or_else(|| find_texture(std::path::Path::new("/tmp")));
+        if let Some(texture) = starting_texture {
+            if let Some(first) = editor.boxes.boxes.first().map(|b| b.entity) {
+                editor.set_box_texture(first, Some(texture));
+            }
+        }
+        editor.content.root = root;
         editor.content.rescan();
         // The hierarchy is the panel worth opening first: it is where the
         // scene's contents are, and clicking a row there moves the gizmo.
@@ -167,6 +301,8 @@ impl App {
             surface: vk::SurfaceKHR::null(),
             frames: 0,
             readback_done: false,
+            _entry: None,
+            _instance: None,
         }
     }
 
@@ -194,12 +330,14 @@ impl App {
         if self.frames == 1 || self.frames % 120 == 0 {
             println!(
                 "[frame {}] egui: {} batch(es), {} vertex(es) -> {} byte(s); \
-                 gizmo {} handle(s)",
+                 gizmo {} handle(s); boxes {} mesh {}",
                 self.frames,
                 data.batch_count(),
                 data.len(),
                 data.byte_len(),
                 self.editor.viewport.handle_count,
+                self.editor.boxes.boxes.len(),
+                self.gpu.as_ref().map(|g| g.mesh_boxes.len()).unwrap_or(0),
             );
         }
 
@@ -211,15 +349,22 @@ impl App {
             // back at all.
             return;
         };
-        // Once only, and only now that there is a GPU to read from. A swapchain
-        // image belongs to the presentation engine between the present and the
-        // next acquire, so copying it every frame races the compositor rather
-        // than merely costing a pipeline stall.
-        let readback = !self.readback_done;
-        self.readback_done = true;
+        // Once only, and only once there is something in the scene to read. A
+        // swapchain image belongs to the presentation engine between the present
+        // and the next acquire, so copying it every frame races the compositor
+        // rather than merely costing a pipeline stall.
+        //
+        // Not on the first frame: the GPU does not exist yet, and the 3D boxes
+        // are brought up on the second. A readback of frame 1 proves the UI drew
+        // and says nothing about the scene, which is the part that can be
+        // silently empty.
+        let readback = !self.readback_done && self.frames >= 3;
+        self.readback_done |= readback;
         // SAFETY: every object is live, and the swapchain matches the size
         // checked above because a resize rebuilds it before the next redraw.
-        unsafe { App::present(gpu, &data, &data.atlas, w, h, readback) };
+        let boxes = &self.editor.boxes;
+        let camera = &self.editor.camera;
+        unsafe { App::present(gpu, &data, &data.atlas, w, h, readback, boxes, camera) };
     }
 
     /// Record, submit and present the UI.
@@ -235,12 +380,18 @@ impl App {
         w: u32,
         h: u32,
         readback: bool,
+        boxes: &vibe_editor::BoxScene,
+        camera: &vibe_editor::EditorCamera,
     ) {
         // The atlas upload takes &mut gpu, so it runs before the device
         // reference is taken for the rest of the frame.
         let Some(queue) = gpu.logical.graphics_queue() else {
             return;
         };
+        // Geometry and textures are brought up to date before the frame is
+        // recorded, so the draw only ever reads state that already matches the
+        // scene. A box resized this frame is the same box the user is looking at.
+        unsafe { sync_boxes(gpu, boxes, queue) };
         unsafe { upload_atlas(gpu, atlas, queue) };
         let device = &gpu.logical.device;
 
@@ -249,7 +400,7 @@ impl App {
         let needed = data.byte_len().max(32);
         if needed > gpu.vertex_buffer.size() as usize {
             let want = (needed.next_power_of_two() as u64).min(MAX_VERTEX_BYTES as u64);
-            match unsafe {
+            let grown = match unsafe {
                 GpuBuffer::create(
                     device,
                     &gpu.heap,
@@ -261,12 +412,23 @@ impl App {
                     MemoryNeed::upload(),
                 )
             } {
-                Ok(b) if b.size() as usize >= needed => gpu.vertex_buffer = b,
+                Ok(b) if b.size() as usize >= needed => b,
                 _ => {
                     eprintln!("FAIL growing the vertex buffer to {needed} bytes");
                     return;
                 }
+            };
+            // The replacement has to be mapped before the write below. A buffer
+            // that is created but not mapped holds undefined memory, and
+            // `write_mapped` refuses it — so a frame that grew the buffer drew
+            // garbage or reported "buffer is not mapped" on every later frame,
+            // depending on which path ran first.
+            let mut grown = grown;
+            if unsafe { grown.map(device) }.is_err() {
+                eprintln!("FAIL mapping the grown vertex buffer");
+                return;
             }
+            gpu.vertex_buffer = grown;
         }
         let bytes: Vec<u8> = data
             .batches
@@ -336,6 +498,25 @@ impl App {
                     vibe_vk::Access::ColorAttachmentWrite,
                 ),
         );
+        // The depth attachment is cleared every frame, not transitioned from
+        // whatever the last frame left. `UNDEFINED` as the old layout is the
+        // documented way to say "the contents do not matter", and it is what
+        // lets the driver skip the copy a DEPTH_ATTACHMENT_OPTIMAL old layout
+        // would imply on a tiled-memory image.
+        if let Some(depth) = gpu.depth.as_ref() {
+            enc.push(
+                vibe_vk::Barrier::image(depth.image(), vk::ImageAspectFlags::DEPTH)
+                    .layouts(
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                    )
+                    .src(vibe_vk::Stage::None, vibe_vk::Access::None)
+                    .dst(
+                        vibe_vk::Stage::EarlyFragmentTests,
+                        vibe_vk::Access::DepthStencilAttachmentWrite,
+                    ),
+            );
+        }
         unsafe { enc.record(device, &gpu.sync2, cmd) };
 
         let area = vk::Rect2D {
@@ -357,12 +538,40 @@ impl App {
             },
             ..Default::default()
         }];
+        // The depth attachment. Present only when there is one: a rendering info
+        // naming a null depth view is invalid, and a frame with no boxes does not
+        // need depth at all.
+        let depth_attachment = [vk::RenderingAttachmentInfo {
+            image_view: gpu
+                .depth
+                .as_ref()
+                .map(|d| d.view())
+                .unwrap_or(vk::ImageView::null()),
+            image_layout: vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            resolve_image_view: vk::ImageView::null(),
+            resolve_mode: vk::ResolveModeFlags::empty(),
+            load_op: vk::AttachmentLoadOp::CLEAR,
+            store_op: vk::AttachmentStoreOp::DONT_CARE,
+            clear_value: vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            },
+            ..Default::default()
+        }];
+        let has_depth = gpu.depth.is_some();
         let rendering_info = vk::RenderingInfo {
             render_area: area,
             layer_count: 1,
             view_mask: 0,
             color_attachment_count: 1,
             p_color_attachments: attachment.as_ptr(),
+            p_depth_attachment: if has_depth {
+                depth_attachment.as_ptr()
+            } else {
+                std::ptr::null()
+            },
             ..Default::default()
         };
         let viewport = vk::Viewport {
@@ -379,6 +588,65 @@ impl App {
         // invariants, which the function's own contract already states.
         unsafe {
             gpu.rendering.cmd_begin_rendering(cmd, &rendering_info);
+
+            // The 3D pass goes first, with depth on and back faces culled. The UI
+            // then draws over it with depth testing off, so a panel always
+            // covers the scene no matter how close a box is to the camera — which
+            // is what keeps a box the user has orbited into from painting over
+            // the hierarchy.
+            if !gpu.mesh_boxes.is_empty() && has_depth {
+                let aspect = w as f32 / (h as f32).max(1.0);
+                let camera_uniform =
+                    CameraUniform::new(camera.view_projection(aspect), camera.position);
+                let bytes = bytemuck::bytes_of(&camera_uniform);
+                let _ = gpu.camera_buffer.write_mapped(0, bytes);
+                device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    gpu.mesh_pipeline.pipeline,
+                );
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    gpu.mesh_pipeline.layout,
+                    0,
+                    &[gpu.mesh_boxes[0].bind_group.set],
+                    &[],
+                );
+                device.cmd_set_viewport(cmd, 0, &[viewport]);
+                device.cmd_set_scissor(cmd, 0, &[area]);
+                // Back-face culling is the point of the box's winding: the unit
+                // cube is wound counter-clockwise as seen from outside, which is
+                // Vulkan's front face, so this drops the inside of each face.
+                device.cmd_set_cull_mode(cmd, vk::CullModeFlags::BACK);
+                device.cmd_set_primitive_topology(cmd, vk::PrimitiveTopology::TRIANGLE_LIST);
+                device.cmd_set_depth_test_enable(cmd, true);
+                for box_state in &gpu.mesh_boxes {
+                    if box_state.vertex_count == 0 {
+                        continue;
+                    }
+                    // One bind group per box, because each names its own texture.
+                    // Rebound per draw rather than gathered into one array: a
+                    // dynamic-offset array would need every box's texture in one
+                    // descriptor, and this scene has one texture per box.
+                    device.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        gpu.mesh_pipeline.layout,
+                        0,
+                        &[box_state.bind_group.set],
+                        &[],
+                    );
+                    device.cmd_bind_vertex_buffers(
+                        cmd,
+                        0,
+                        &[box_state.vertex_buffer.buffer()],
+                        &[0],
+                    );
+                    device.cmd_draw(cmd, box_state.vertex_count, 1, 0, 0);
+                }
+            }
+
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, gpu.pipeline.pipeline);
             device.cmd_bind_descriptor_sets(
                 cmd,
@@ -661,6 +929,10 @@ impl winit::application::ApplicationHandler for App {
                     self._messenger = setup.messenger;
                     self.surface = setup.surface;
                     self.gpu = Some(setup.gpu);
+                    // Taken out of `setup` so the device's dispatch table stays
+                    // valid for the whole loop rather than only during setup.
+                    self._instance = Some(setup.instance);
+                    self._entry = Some(setup.entry);
                 }
                 Some(Err(e)) => eprintln!("FAIL setup: {e}"),
                 None => {}
@@ -759,6 +1031,17 @@ impl App {
         let pipeline = build_ui_pipeline(device, &compiler, &[swapchain.format().format])
             .map_err(|e| e.to_string())?;
         println!("[4] ui pipeline built (key {:#x})", pipeline.cache_key);
+
+        // The 3D pipeline writes depth, so it needs a depth attachment the UI
+        // does not. The format is chosen from what the device reports rather
+        // than hardcoded: asking for one the surface does not offer makes
+        // image creation fail, and D32_SFLOAT is not universal.
+        let mesh_pipeline = build_mesh_pipeline(device, &compiler, &[swapchain.format().format])
+            .map_err(|e| e.to_string())?;
+        println!(
+            "[5] mesh pipeline built (key {:#x})",
+            mesh_pipeline.cache_key
+        );
 
         let props = instance.get_physical_device_memory_properties(pd.handle);
         let heap = HeapLayout {
@@ -927,6 +1210,51 @@ impl App {
         .map_err(|e| e.to_string())?;
         atlas_staging.map(device).map_err(|e| e.to_string())?;
 
+        // The camera uniform, written fresh every frame.
+        let camera_size = std::mem::size_of::<vibe_render::mesh3d::CameraUniform>() as u64;
+        let mut camera_buffer = GpuBuffer::create(
+            device,
+            &heap,
+            camera_size,
+            BufferUsage {
+                uniform: true,
+                ..Default::default()
+            },
+            MemoryNeed::upload(),
+        )
+        .map_err(|e| e.to_string())?;
+        camera_buffer.map(device).map_err(|e| e.to_string())?;
+
+        // The depth attachment. Sized to the window and rebuilt on a resize,
+        // because a depth buffer from the old size makes every barrier and the
+        // render area disagree about the extent.
+        let depth = unsafe {
+            GpuImage::create_2d(
+                device,
+                &heap,
+                w,
+                h,
+                DEPTH_FORMAT,
+                ImageUsage::depth_target(),
+                vk::ImageTiling::OPTIMAL,
+                vk::SampleCountFlags::TYPE_1,
+            )
+        }
+        .map_err(|e| e.to_string())?;
+
+        let texture_sampler = create_sampler(device).map_err(|e| e.to_string())?;
+        let texture_pool =
+            vibe_frame::CommandPool::new(device, logical.graphics_family().unwrap_or(0), 1)
+                .map_err(|e| e.to_string())?;
+
+        // The 1x1 white image goes up through the same pool as any other texture,
+        // which is why it is built here rather than as a raw image: an image
+        // created but never written holds undefined memory, and the mesh shader
+        // samples it on every draw.
+        let white = vibe_render::texture::DecodedImage::white();
+        let white_texture =
+            unsafe { upload_texture(device, &heap, queue, &texture_pool, &white, &sync2)? };
+
         Ok(Setup {
             gpu: Gpu {
                 logical,
@@ -953,30 +1281,324 @@ impl App {
                 // egui's is fixed once the fonts are loaded.
                 atlas_staging,
                 uploaded_atlas: FontAtlas::default(),
+                mesh_pipeline,
+                camera_buffer,
+                depth: Some(depth),
+                white_texture,
+                texture_sampler,
+                mesh_boxes: Vec::new(),
+                texture_pool,
             },
             messenger,
             surface: vk_surface,
+            entry,
+            instance,
         })
     }
 }
 
-/// Copy the rendered image out and count the pixels that are not the clear.
-/// Upload the font atlas when egui has rasterised a new one.
+/// Bring each box's GPU state in line with the scene.
 ///
-/// egui rasterises its atlas once and reuses it, so this runs on the first
-/// frame and after a font change, not every frame. The image is recreated
-/// because egui can grow it, and a bind group naming a view of the old image
-/// would sample freed memory.
+/// Three things can be out of date, and each is checked rather than rebuilt
+/// unconditionally: the geometry, when a resize or a move changed it; the
+/// texture, when the user picked a different image; and the descriptor set,
+/// which has to be rebuilt whenever either the texture or the pipeline's layout
+/// changed. Rebuilding all three every frame would re-decode every JPEG and
+/// re-upload every vertex on every frame, which at 60 Hz is a visible stall.
 ///
 /// # Safety
 ///
-/// The device must be live and the bind group is rebuilt before any draw.
+/// The device must be live and `queue` must be a graphics queue from it.
+unsafe fn sync_boxes(gpu: &mut Gpu, boxes: &vibe_editor::BoxScene, queue: vk::Queue) {
+    let device = &gpu.logical.device;
+    // A box removed from the scene takes its GPU state with it. Dropped rather
+    // than left behind, because a stale entry is an index into a scene that no
+    // longer has that box, and it would keep a texture resident forever.
+    if gpu.mesh_boxes.len() > boxes.boxes.len() {
+        for mut stale in gpu.mesh_boxes.split_off(boxes.boxes.len()) {
+            unsafe { stale.bind_group.destroy(device) };
+            if let Some(mut t) = stale.texture.take() {
+                unsafe { t.destroy(device) };
+            }
+            let mut vb = stale.vertex_buffer;
+            unsafe { vb.destroy(device) };
+        }
+    }
+
+    for (index, scene_box) in boxes.boxes.iter().enumerate() {
+        if !scene_box.visible {
+            continue;
+        }
+        // The vertices are in world space, so both a move and a resize change
+        // them. A box that has not moved and not been resized reuses the buffer
+        // it already has.
+        let geometry_changed = gpu.mesh_boxes.get(index).is_none_or(|b| {
+            b.built_size != scene_box.size || b.built_position != scene_box.position
+        });
+        if geometry_changed {
+            let vertices = vibe_render::mesh3d::box_vertices(scene_box.size);
+            let moved: Vec<vibe_render::mesh3d::MeshVertex> = vertices
+                .into_iter()
+                .map(|v| {
+                    vibe_render::mesh3d::MeshVertex::new(
+                        glam::Vec3::from_array(v.position) + scene_box.position,
+                        glam::Vec3::from_array(v.normal),
+                        glam::Vec2::from_array(v.uv),
+                    )
+                })
+                .collect();
+            let bytes: Vec<u8> = moved
+                .iter()
+                .flat_map(|v| bytemuck::bytes_of(v).to_vec())
+                .collect();
+            let Ok(mut buffer) = GpuBuffer::create(
+                device,
+                &gpu.heap,
+                bytes.len() as u64,
+                BufferUsage {
+                    vertex: true,
+                    ..Default::default()
+                },
+                MemoryNeed::upload(),
+            ) else {
+                continue;
+            };
+            if unsafe { buffer.map(device) }.is_err()
+                || unsafe { buffer.write_mapped(0, &bytes) }.is_err()
+            {
+                unsafe { buffer.destroy(device) };
+                continue;
+            }
+            match gpu.mesh_boxes.get_mut(index) {
+                Some(existing) => {
+                    let mut old = std::mem::replace(&mut existing.vertex_buffer, buffer);
+                    unsafe { old.destroy(device) };
+                    existing.vertex_count = moved.len() as u32;
+                    existing.built_size = scene_box.size;
+                    existing.built_position = scene_box.position;
+                }
+                None => {
+                    // A new box still needs a descriptor set, which needs a
+                    // texture; the white one stands in until a texture arrives.
+                    let Ok(bind_group) = vibe_render::mesh3d::MeshBindGroup::create(
+                        device,
+                        gpu.mesh_pipeline.descriptor_layout,
+                        gpu.camera_buffer.buffer(),
+                        std::mem::size_of::<CameraUniform>() as u64,
+                        gpu.white_texture.view(),
+                        gpu.texture_sampler,
+                    ) else {
+                        unsafe { buffer.destroy(device) };
+                        continue;
+                    };
+                    gpu.mesh_boxes.push(MeshBox {
+                        vertex_buffer: buffer,
+                        vertex_count: moved.len() as u32,
+                        built_size: scene_box.size,
+                        built_position: scene_box.position,
+                        texture: None,
+                        texture_path: None,
+                        bind_group,
+                    });
+                }
+            }
+        }
+
+        // A texture that has not changed is not re-decoded. The comparison is on
+        // the path, so re-picking the same file is free.
+        let texture_changed = gpu
+            .mesh_boxes
+            .get(index)
+            .is_some_and(|b| b.texture_path != scene_box.texture);
+        if texture_changed {
+            // Either a decoded-and-uploaded image or the white fallback. The
+            // image itself is moved into the box's state below so its texture
+            // stays alive for as long as any descriptor set names its view.
+            let mut uploaded: Option<GpuImage> = None;
+            let view = match &scene_box.texture {
+                None => gpu.white_texture.view(),
+                Some(path) => {
+                    // `.ok()` rather than a match, so the failure branch below
+                    // can fall back without a second binding to keep in step.
+                    let decoded = match vibe_render::texture::load(path) {
+                        Ok(d) => Some(d),
+                        Err(e) => {
+                            // Reported once, then the box falls back to white
+                            // rather than disappearing: an image that fails to
+                            // decode should still leave a box on screen.
+                            eprintln!("texture {}: {e}", path.display());
+                            None
+                        }
+                    };
+                    match decoded {
+                        None => gpu.white_texture.view(),
+                        Some(d) => match unsafe {
+                            upload_texture(
+                                device,
+                                &gpu.heap,
+                                queue,
+                                &gpu.texture_pool,
+                                &d,
+                                &gpu.sync2,
+                            )
+                        } {
+                            Ok(image) => {
+                                let v = image.view();
+                                uploaded = Some(image);
+                                v
+                            }
+                            Err(e) => {
+                                eprintln!("texture {}: {e}", path.display());
+                                gpu.white_texture.view()
+                            }
+                        },
+                    }
+                }
+            };
+            let sampler = gpu.texture_sampler;
+            if let Some(state) = gpu.mesh_boxes.get_mut(index) {
+                if let Ok(bind_group) = vibe_render::mesh3d::MeshBindGroup::create(
+                    device,
+                    gpu.mesh_pipeline.descriptor_layout,
+                    gpu.camera_buffer.buffer(),
+                    std::mem::size_of::<CameraUniform>() as u64,
+                    view,
+                    sampler,
+                ) {
+                    // The old texture is freed only after the new descriptor set
+                    // is bound: the set being replaced still names the old view,
+                    // and a texture destroyed under a live set is what the driver
+                    // reports as a lost device several frames later. The white
+                    // texture is shared, so it is never stored here and so never
+                    // freed — only a texture this box uploaded is.
+                    unsafe { state.bind_group.destroy(device) };
+                    state.bind_group = bind_group;
+                    if let Some(mut old) = state.texture.take() {
+                        unsafe { old.destroy(device) };
+                    }
+                    state.texture = uploaded.take();
+                    state.texture_path = scene_box.texture.clone();
+                }
+            }
+        }
+    }
+}
+
+/// Create a texture, upload `image` into it, and leave it in the layout a
+/// sampled-image descriptor names.
+///
+/// The three transitions are not optional. An image created and written but
+/// left in `UNDEFINED` holds undefined memory that a sampling shader reads, and
+/// a descriptor naming a view is a promise about the image's layout — the layer
+/// reports the mismatch at the draw, not at the upload.
+///
+/// Takes its own command pool from the caller, because opening a second buffer
+/// in a pool that still has one open segfaults on this driver rather than
+/// returning an error.
+///
+/// # Safety
+///
+/// `device` must be live, `queue` must be a graphics queue from it, and `pool`
+/// must have a free command buffer.
+unsafe fn upload_texture(
+    device: &ash::Device,
+    heap: &HeapLayout,
+    queue: vk::Queue,
+    pool: &vibe_frame::CommandPool,
+    image: &vibe_render::texture::DecodedImage,
+    sync2: &ash::khr::synchronization2::Device,
+) -> Result<GpuImage, String> {
+    let gpu_image = GpuImage::create_2d(
+        device,
+        heap,
+        image.width,
+        image.height,
+        vibe_render::texture::texture_format(),
+        ImageUsage::texture(),
+        vk::ImageTiling::OPTIMAL,
+        vk::SampleCountFlags::TYPE_1,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // A staging buffer per upload, sized to this image. Allocated and freed per
+    // texture rather than reused, because the copy has to have completed before
+    // the buffer is freed and a shared one would need a fence per upload anyway.
+    let need = image.byte_len() as u64;
+    let mut staging = GpuBuffer::create(
+        device,
+        heap,
+        need,
+        BufferUsage {
+            transfer_src: true,
+            ..Default::default()
+        },
+        MemoryNeed::upload(),
+    )
+    .map_err(|e| e.to_string())?;
+    unsafe { staging.map(device) }.map_err(|e| e.to_string())?;
+    unsafe { staging.write_mapped(0, &image.pixels) }.map_err(|e| e.to_string())?;
+
+    if pool.reset(device).is_err() {
+        return Err("could not reset the texture pool".to_string());
+    }
+    let Ok(cmd) = (unsafe { pool.begin(device, 0) }) else {
+        return Err("could not begin the texture upload".to_string());
+    };
+    {
+        let mut enc = vibe_vk::BarrierEncoder::for_tier(vibe_vk::SyncTier::Sync2Timeline);
+        enc.push(
+            vibe_vk::Barrier::image(gpu_image.image(), vk::ImageAspectFlags::COLOR)
+                .layouts(
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                )
+                .src(vibe_vk::Stage::None, vibe_vk::Access::None)
+                .dst(vibe_vk::Stage::Transfer, vibe_vk::Access::TransferWrite),
+        );
+        unsafe { enc.record(device, sync2, cmd) };
+        if unsafe { gpu_image.record_upload(device, cmd, staging.buffer()) }.is_err() {
+            return Err("could not record the texture copy".to_string());
+        }
+        let mut enc2 = vibe_vk::BarrierEncoder::for_tier(vibe_vk::SyncTier::Sync2Timeline);
+        enc2.push(
+            vibe_vk::Barrier::image(gpu_image.image(), vk::ImageAspectFlags::COLOR)
+                .layouts(
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                )
+                .src(vibe_vk::Stage::Transfer, vibe_vk::Access::TransferWrite)
+                .dst(vibe_vk::Stage::FragmentShader, vibe_vk::Access::ShaderRead),
+        );
+        unsafe { enc2.record(device, sync2, cmd) };
+    }
+    if unsafe { pool.end(device, 0) }.is_err() {
+        return Err("could not end the texture upload".to_string());
+    }
+
+    let batch = vibe_frame::SubmitBatch::single(cmd, vibe_frame::SubmitSync::None);
+    let sub = vibe_frame::build_submit_info(&batch);
+    let Ok(fence) = (unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }) else {
+        return Err("could not create the texture fence".to_string());
+    };
+    if unsafe { sync2.queue_submit2(queue, &[sub.info], fence) }.is_err() {
+        unsafe { device.destroy_fence(fence, None) };
+        return Err("could not submit the texture upload".to_string());
+    }
+    let _ = unsafe { device.wait_for_fences(&[fence], true, TIMEOUT) };
+    unsafe { device.destroy_fence(fence, None) };
+    // The staging buffer is freed here, after the fence: freeing it earlier is a
+    // use-after-free the driver reports as a lost device some frames later.
+    let mut staging = staging;
+    unsafe { staging.destroy(device) };
+    Ok(gpu_image)
+}
+
 /// Upload the font atlas when egui has rasterised a new one.
 ///
 /// egui rasterises its atlas once and reuses it, so this runs on the first
-/// frame that has a GPU and after a font change. The image is recreated
-/// because egui can grow it, and a bind group naming a view of the old image
-/// would sample freed memory.
+/// frame that has a GPU and after a font change, not every frame. The image is
+/// recreated because egui can grow it, and a bind group naming a view of the
+/// old image would sample freed memory.
 ///
 /// # Safety
 ///

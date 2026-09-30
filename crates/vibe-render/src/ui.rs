@@ -19,6 +19,7 @@ use vibe_pipeline::{
 };
 
 use crate::error::RenderError;
+use crate::mesh3d::DEPTH_FORMAT;
 use crate::pipeline::create_module;
 use vibe_shader::ShaderCompiler;
 
@@ -402,6 +403,14 @@ pub unsafe fn build_ui_pipeline<C: ShaderCompiler>(
         let rendering = vk::PipelineRenderingCreateInfo {
             color_attachment_count: desc.color_attachment_count,
             p_color_attachment_formats: target_formats.as_ptr(),
+            // The UI does not *test* depth, but it is drawn inside a render pass
+            // that has a depth attachment bound — the 3D pass shares the
+            // target. Dynamic rendering has no render pass object to declare the
+            // attachment's format, so the bound pipeline must, and a pipeline
+            // that says UNDEFINED is invalid against a real depth attachment even
+            // when it never reads it. The format therefore has to be the same
+            // value the frame creates the depth image with.
+            depth_attachment_format: DEPTH_FORMAT,
             ..Default::default()
         };
         let create_info = vk::GraphicsPipelineCreateInfo {

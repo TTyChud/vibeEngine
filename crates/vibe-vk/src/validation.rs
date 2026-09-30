@@ -30,12 +30,16 @@ pub fn enable_layer() {
     // SAFETY: single-threaded startup, before any Vulkan object exists.
     unsafe {
         std::env::set_var("VK_INSTANCE_LAYERS", "VK_LAYER_KHRONOS_validation");
-        // The core validation layers are noisy about API that is legal, so
-        // start with the ones that catch real mistakes.
-        std::env::set_var(
-            "VK_LAYER_ENABLES",
-            "VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT",
-        );
+        // The core validation layers are noisy about API that is legal, so start
+        // with the ones that catch real mistakes.
+        //
+        // The modern setting name, not the deprecated `VK_LAYER_ENABLES`. The
+        // layer prints a warning for every run when the old name is used — it
+        // says the deprecated settings take precedence and cannot be mixed with
+        // the new ones — and that warning is printed before the messenger
+        // exists, so it arrives as driver stderr rather than as a routed
+        // validation message.
+        std::env::set_var("VK_LAYER_VALIDATE_SYNC", "1");
     }
 }
 
@@ -150,6 +154,11 @@ mod tests {
             std::env::var("VK_INSTANCE_LAYERS").ok().as_deref(),
             Some("VK_LAYER_KHRONOS_validation")
         );
-        assert!(std::env::var("VK_LAYER_ENABLES").is_ok());
+        // The current spelling, not the deprecated `VK_LAYER_ENABLES`, which the
+        // layer warns about on every single run.
+        assert_eq!(
+            std::env::var("VK_LAYER_VALIDATE_SYNC").ok().as_deref(),
+            Some("1")
+        );
     }
 }

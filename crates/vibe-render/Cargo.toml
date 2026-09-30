@@ -21,6 +21,7 @@ vibe-rhi.workspace = true
 vibe-shader.workspace = true
 vibe-vk.workspace = true
 vibe-window.workspace = true
+image = { version = "0.25.9", default-features = false, features = ["png", "jpeg"] }
 
 [dev-dependencies]
 glam.workspace = true

@@ -293,8 +293,14 @@ impl EditorFrame<'_> {
         {
             self.scene_viewport.follow(t.translation(), t.matrix());
         }
+        // The central panel's background is transparent, not a dark fill. The
+        // panel is drawn *over* the 3D scene in the same render pass, so an
+        // opaque fill here paints the entire viewport with flat colour and
+        // hides every box — while the gizmo, drawn afterwards as egui shapes,
+        // still appears on top, which is what makes it look like a scene with
+        // nothing in it rather than a UI bug.
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(egui::Color32::from_rgb(24, 26, 31)))
+            .frame(egui::Frame::new().fill(egui::Color32::TRANSPARENT))
             .show(ui, |ui| {
                 self.scene_viewport.show(ui, self.camera);
             });
@@ -449,6 +455,12 @@ pub struct Editor {
     pub content: ContentBrowser,
     /// The scene being edited.
     pub world: vibe_ecs::World,
+    /// The 3D boxes placed in the scene.
+    ///
+    /// Kept beside the ECS rather than inside it because a box's resize drag is
+    /// UI state with no meaning in a saved scene, and putting it on a component
+    /// would mean writing the drag into the entity the user is editing.
+    pub boxes: crate::box_scene::BoxScene,
     /// Which panel is open.
     pub panel: Panel,
     /// The scene area, with the transform gizmo over it.
@@ -498,6 +510,7 @@ impl Editor {
             log_panel: LogPanel::new(),
             content: ContentBrowser::new(),
             world: vibe_ecs::World::new(),
+            boxes: crate::box_scene::BoxScene::new(),
             panel: Panel::Hierarchy,
             viewport: crate::viewport::Viewport::new(),
             camera: crate::camera::EditorCamera::perspective(),
@@ -540,6 +553,31 @@ impl Editor {
         self.world
             .add(e, vibe_ecs::components::Tag(name.to_string()));
         e
+    }
+
+    /// Add a 3D box to the scene, on a fresh entity.
+    ///
+    /// One call rather than "spawn then place", because a box whose entity has
+    /// no [`crate::box_scene::SceneBox`] is a scene the renderer silently skips:
+    /// the user pressed the button, nothing appeared, and nothing said why.
+    pub fn spawn_box(&mut self, name: &str) -> vibe_ecs::Entity {
+        let e = self.spawn(name);
+        self.boxes.place(e);
+        self.boxes.sync_transform(e, &mut self.world);
+        // Selected on creation, because a box the user cannot select is a box
+        // they cannot texture or resize.
+        self.hierarchy.select(e);
+        self.session.selection = Some(e);
+        e
+    }
+
+    /// Put a texture on a box, by entity.
+    pub fn set_box_texture(
+        &mut self,
+        entity: vibe_ecs::Entity,
+        path: Option<std::path::PathBuf>,
+    ) -> bool {
+        self.boxes.set_texture(entity, path)
     }
 
     /// Open another panel, or close the current one.

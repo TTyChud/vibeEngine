@@ -3,8 +3,10 @@
 pub mod batch;
 pub mod bind_group;
 pub mod error;
+pub mod mesh3d;
 pub mod pipeline;
 pub mod renderer;
+pub mod texture;
 pub mod ui;
 
 pub use batch::Batcher;

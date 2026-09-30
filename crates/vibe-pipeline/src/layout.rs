@@ -14,6 +14,8 @@ use crate::error::PipelineError;
 pub enum VertexFormat {
     /// Two 32-bit floats.
     Float2,
+    /// Three 32-bit floats.
+    Float3,
     /// Four 32-bit floats.
     Float4,
     /// Four normalised 8-bit unsigned integers, as a colour.
@@ -31,6 +33,7 @@ impl VertexFormat {
     pub const fn size(self) -> u32 {
         match self {
             VertexFormat::Float2 => 8,
+            VertexFormat::Float3 => 12,
             VertexFormat::Float4 => 16,
             VertexFormat::Unorm8x4 => 4,
             VertexFormat::Uint32 => 4,
@@ -43,6 +46,7 @@ impl VertexFormat {
     pub const fn vk_format(self) -> vk::Format {
         match self {
             VertexFormat::Float2 => vk::Format::R32G32_SFLOAT,
+            VertexFormat::Float3 => vk::Format::R32G32B32_SFLOAT,
             VertexFormat::Float4 => vk::Format::R32G32B32A32_SFLOAT,
             VertexFormat::Unorm8x4 => vk::Format::R8G8B8A8_UNORM,
             VertexFormat::Uint32 => vk::Format::R32_UINT,
@@ -55,6 +59,7 @@ impl VertexFormat {
     pub const fn components(self) -> u32 {
         match self {
             VertexFormat::Float2 => 2,
+            VertexFormat::Float3 => 3,
             VertexFormat::Float4 => 4,
             VertexFormat::Unorm8x4 => 4,
             VertexFormat::Uint32 => 1,

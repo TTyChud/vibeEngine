@@ -10,6 +10,7 @@
 //! The crate is `unsafe_code = "forbid"` and holds no Vulkan handles: it decides
 //! what to draw and where, and `vibe_render` decides how.
 
+pub mod box_scene;
 pub mod camera;
 pub mod content;
 pub mod frame;
@@ -21,6 +22,9 @@ pub mod session;
 pub mod ui_bridge;
 pub mod viewport;
 
+pub use box_scene::{
+    BoxScene, ResizeDrag, ResizeHandle, SceneBox, opposite_corner, pick_corner, resize_to,
+};
 pub use camera::{Camera2DController, CameraInput, EditorCamera};
 pub use content::{ContentBrowser, ContentEntry, ContentKind};
 pub use frame::{Editor, EditorFrame, Panel};

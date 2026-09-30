@@ -178,14 +178,20 @@ impl App {
             );
         }
 
-        // Once only. A swapchain image belongs to the presentation engine
-        // between the present and the next acquire, so copying it every frame
-        // races the compositor rather than merely costing a pipeline stall.
-        let readback = !self.readback_done;
-        self.readback_done = true;
         let Some(gpu) = self.gpu.as_mut() else {
+            // The first frame runs before setup finishes, so there is nothing to
+            // read back from yet. Returning here without touching the readback
+            // flag is the point: consuming it would leave every later frame with
+            // the one readback already spent, and the frame would never be read
+            // back at all.
             return;
         };
+        // Once only, and only now that there is a GPU to read from. A swapchain
+        // image belongs to the presentation engine between the present and the
+        // next acquire, so copying it every frame races the compositor rather
+        // than merely costing a pipeline stall.
+        let readback = !self.readback_done;
+        self.readback_done = true;
         // SAFETY: every object is live, and the swapchain matches the size
         // checked above because a resize rebuilds it before the next redraw.
         unsafe { App::present(gpu, &data, w, h, readback) };
@@ -432,20 +438,31 @@ impl App {
         // this the loop stalls after frames_in_flight submissions.
         gpu.resources.on_complete();
 
-        let _ = gpu
-            .swapchain
-            .present(&gpu.swapchain_loader, queue, index, present_sem);
-
         if readback {
-            // After the present, because that is when the image is in
-            // PRESENT_SRC_KHR. Reading it beforehand declares a source layout it
-            // is not in, which is a validation error rather than a wrong pixel.
-            let lit = read_back(device, &gpu.sync2, &gpu.logical, queue, target_image, w, h);
+            // After the present transition, and before the submit: the image is
+            // in PRESENT_SRC_KHR there, and restoring it to the same layout
+            // leaves the present's own expectations intact. Once only, because
+            // a swapchain image belongs to the presentation engine between the
+            // present and the next acquire.
+            let lit = read_back(
+                device,
+                &gpu.sync2,
+                &gpu.logical,
+                &gpu.present_pool,
+                queue,
+                target_image,
+                w,
+                h,
+            );
             println!(
                 "[readback] {lit} of {} pixel(s) differ from the clear",
                 w as u64 * h as u64
             );
         }
+
+        let _ = gpu
+            .swapchain
+            .present(&gpu.swapchain_loader, queue, index, present_sem);
     }
 
     /// Rebuild the swapchain after a resize.
@@ -800,17 +817,28 @@ impl App {
 }
 
 /// Copy the rendered image out and count the pixels that are not the clear.
+/// Copy the rendered image out and count the pixels that are not the clear.
+///
+/// Takes a command pool from the caller rather than creating one. Creating a
+/// second pool while the frame's own pool is still recording is the one Vulkan
+/// call here the 2D example does not make at the same point, and on this driver
+/// it takes the process down rather than returning an error.
+///
+/// # Safety
+///
+/// `pool` must have a free command buffer and the image must be in
+/// `PRESENT_SRC_KHR`, which is where the frame's present transition leaves it.
 unsafe fn read_back(
     device: &ash::Device,
     sync2: &ash::khr::synchronization2::Device,
     logical: &vibe_vk::LogicalDevice,
+    pool: &vibe_frame::CommandPool,
     queue: vk::Queue,
     image: vk::Image,
     width: u32,
     height: u32,
 ) -> usize {
-    let stride = width as u64 * 4;
-    let size = stride * height as u64;
+    let size = width as u64 * 4 * height as u64;
     let Ok(mut buffer) = GpuBuffer::create(
         device,
         logical.memory_layout(),
@@ -826,15 +854,15 @@ unsafe fn read_back(
     if buffer.map(device).is_err() {
         return 0;
     }
-    let Ok(pool) = vibe_frame::CommandPool::new(device, logical.graphics_family().unwrap_or(0), 1)
-    else {
-        return 0;
-    };
     let Ok(cmd) = pool.begin(device, 0) else {
         return 0;
     };
     {
         let mut enc = vibe_vk::BarrierEncoder::for_tier(logical.sync_tier());
+        // The frame's present transition has already been recorded, so the
+        // image is in PRESENT_SRC_KHR. Reading from any other layout is a
+        // mismatch the driver reports, and restoring to anything but
+        // PRESENT_SRC_KHR breaks the present that follows.
         enc.push(
             vibe_vk::Barrier::image(image, vk::ImageAspectFlags::COLOR)
                 .layouts(
@@ -878,8 +906,8 @@ unsafe fn read_back(
                 .src(vibe_vk::Stage::Transfer, vibe_vk::Access::TransferWrite)
                 .dst(vibe_vk::Stage::Host, vibe_vk::Access::HostRead),
         );
-        // The copy left the image in TRANSFER_SRC_OPTIMAL and present needs
-        // PRESENT_SRC_KHR; reading a frame must not break the frame after it.
+        // Back to PRESENT_SRC_KHR, which is the layout the present needs and
+        // the one the image was in before the copy.
         enc2.push(
             vibe_vk::Barrier::image(image, vk::ImageAspectFlags::COLOR)
                 .layouts(

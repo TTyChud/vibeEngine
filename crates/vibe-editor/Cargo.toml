@@ -21,5 +21,20 @@ vibe-render.workspace = true
 vibe-rhi.workspace = true
 vibe-scene.workspace = true
 
+[dev-dependencies]
+# The editor holds no Vulkan objects, so the example that proves the UI renders
+# on a real driver brings its own unsafe dependencies. Putting them here rather
+# than in the library is what keeps the crate itself free of unsafe code.
+ash.workspace = true
+bytemuck.workspace = true
+vibe-frame.workspace = true
+vibe-shader.workspace = true
+vibe-vk.workspace = true
+vibe-window.workspace = true
+winit = "0.30"
+
 [lints.rust]
-unsafe_code = "forbid"
+# The library is free of unsafe code; its examples are the hardware
+# verification and necessarily drive Vulkan directly, which is the one thing
+# the editor itself refuses to do.
+unsafe_code = "allow"

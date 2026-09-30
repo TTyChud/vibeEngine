@@ -75,12 +75,15 @@ struct Pixels {
     scale_offset: vec4<f32>,
 }
 
+// A uniform buffer rather than a push constant, because naga 0.30's WGSL front
+// end has no push-constant address space: `var<push_constant>` is an unknown
+// address space and `@push_constant` is an unknown attribute, so a shader
+// written that way does not parse at all. The quad pipeline already takes its
+// camera the same way, so this is also the shape the project is used to.
 @group(0) @binding(0) var<uniform> transform: Pixels;
-@group(0) @binding(1) var font_atlas: texture_2d<f32>;
-@group(0) @binding(2) var atlas_sampler: sampler;
 
 @vertex
-fn vs_main(vertex: UiVertex, @builtin(vertex_index) index: u32) -> VertexOut {
+fn vs_main(vertex: UiVertex) -> VertexOut {
     var out: VertexOut;
     let p = vertex.position;
     out.clip_position = vec4<f32>(
@@ -104,11 +107,15 @@ pub const VERTEX_ENTRY: &str = "vs_main";
 /// The name of the fragment entry point.
 pub const FRAGMENT_ENTRY: &str = "fs_main";
 
-/// The descriptor bindings the UI shader expects.
+/// The descriptor bindings the UI shader uses. It uses none: the transform is
+/// a push constant and the fragment stage returns the vertex colour, so the
+/// pipeline layout declares no set at all. These are kept because a future
+/// textured UI panel would reintroduce them, and because a declared-but-unbound
+/// set is what makes a draw invalid rather than merely wasteful.
 pub const TRANSFORM_BINDING: u32 = 0;
-/// The font atlas texture.
+/// The font atlas texture, for a panel that draws one.
 pub const ATLAS_BINDING: u32 = 1;
-/// The font atlas sampler.
+/// The font atlas sampler, for a panel that draws one.
 pub const SAMPLER_BINDING: u32 = 2;
 
 /// The push-constant block the vertex stage reads.
@@ -144,7 +151,9 @@ pub fn ui_pipeline_desc() -> PipelineDesc {
     PipelineDesc {
         name: "ui".to_string(),
         layout: ui_vertex_layout(),
-        push_constant_bytes: std::mem::size_of::<ScreenTransform>() as u32,
+        // No push constants: naga 0.30's WGSL front end cannot parse them, so
+        // the transform is a uniform buffer like the quad pipeline's camera.
+        push_constant_bytes: 0,
         // The UI is drawn back to front with alpha, exactly like the 2D
         // batcher, and with no depth so a panel always covers the scene.
         blend: BlendState::AlphaBlend,
@@ -245,10 +254,10 @@ pub unsafe fn build_ui_pipeline<C: ShaderCompiler>(
             }
         };
 
-        // Only the transform is bound. The shader also declares a font atlas and
-        // a sampler, which the layout deliberately omits: the fragment stage
-        // returns the vertex colour, and a binding the shader never reads would
-        // make every frame carry a descriptor set it does not need.
+        // Exactly one set, holding the screen transform, which the shader reads
+        // at binding 0. Declaring a set the shader does not use is not merely
+        // wasteful: Vulkan requires every statically-used set to be bound at
+        // draw time, so a declared-but-unbound set makes the draw invalid.
         let bindings = [vk::DescriptorSetLayoutBinding {
             binding: TRANSFORM_BINDING,
             descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
@@ -263,16 +272,11 @@ pub unsafe fn build_ui_pipeline<C: ShaderCompiler>(
         };
         let descriptor_layout = device.create_descriptor_set_layout(&layout_info, None)?;
 
-        let push = vk::PushConstantRange {
-            stage_flags: vk::ShaderStageFlags::VERTEX,
-            offset: 0,
-            size: desc.push_constant_bytes,
-        };
         let pipeline_layout_info = vk::PipelineLayoutCreateInfo {
             set_layout_count: 1,
             p_set_layouts: &descriptor_layout,
-            push_constant_range_count: 1,
-            p_push_constant_ranges: &push,
+            push_constant_range_count: 0,
+            p_push_constant_ranges: std::ptr::null(),
             ..Default::default()
         };
         let layout = match device.create_pipeline_layout(&pipeline_layout_info, None) {
@@ -437,6 +441,93 @@ pub fn scissor_from_bounds(
     }
 }
 
+/// A descriptor set holding one uniform buffer, which is all the UI pipeline
+/// needs.
+///
+/// The existing `BindGroup` is built around a layout with a camera, a texture
+/// and a sampler, so it cannot express "one uniform and nothing else" without
+/// binding a texture the UI shader does not sample. A small dedicated type keeps
+/// the pool sized to what the pipeline actually declares.
+pub struct UiBindGroup {
+    /// The allocated set.
+    pub set: vk::DescriptorSet,
+    /// The pool it was allocated from, which the caller must destroy.
+    pub pool: vk::DescriptorPool,
+}
+
+impl std::fmt::Debug for UiBindGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UiBindGroup")
+            .field("set", &self.set)
+            .finish()
+    }
+}
+
+impl UiBindGroup {
+    /// Allocate a set from `layout` and point binding 0 at `buffer`.
+    ///
+    /// # Safety
+    ///
+    /// `device` must be live, `layout` must be the UI pipeline's descriptor set
+    /// layout, and `buffer` must outlive the set.
+    pub unsafe fn create(
+        device: &ash::Device,
+        layout: vk::DescriptorSetLayout,
+        buffer: vk::Buffer,
+        range: vk::DeviceSize,
+    ) -> Result<UiBindGroup, RenderError> {
+        let pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: 1,
+        }];
+        let pool_info = vk::DescriptorPoolCreateInfo {
+            max_sets: 1,
+            pool_size_count: pool_sizes.len() as u32,
+            p_pool_sizes: pool_sizes.as_ptr(),
+            ..Default::default()
+        };
+        let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
+
+        let set_info = vk::DescriptorSetAllocateInfo {
+            descriptor_pool: pool,
+            p_set_layouts: &layout,
+            descriptor_set_count: 1,
+            ..Default::default()
+        };
+        let sets = match unsafe { device.allocate_descriptor_sets(&set_info) } {
+            Ok(s) => s,
+            Err(e) => {
+                unsafe { device.destroy_descriptor_pool(pool, None) };
+                return Err(RenderError::Vk(e));
+            }
+        };
+        let info = [vk::DescriptorBufferInfo {
+            buffer,
+            offset: 0,
+            range,
+        }];
+        let write = vk::WriteDescriptorSet {
+            dst_set: sets[0],
+            dst_binding: TRANSFORM_BINDING,
+            descriptor_count: 1,
+            p_buffer_info: info.as_ptr(),
+            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+            ..Default::default()
+        };
+        unsafe { device.update_descriptor_sets(&[write], &[]) };
+        Ok(UiBindGroup { set: sets[0], pool })
+    }
+
+    /// Destroy the pool, which frees the set with it.
+    ///
+    /// # Safety
+    ///
+    /// The device must be alive and the set must be out of use.
+    pub unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe { device.destroy_descriptor_pool(self.pool, None) };
+    }
+}
+
 /// How many vertices the UI draws per frame before it is truncated.
 ///
 /// A full 4K frame of dense UI is a few hundred thousand triangles; a million
@@ -580,13 +671,10 @@ mod tests {
     }
 
     #[test]
-    fn the_pipeline_declares_push_constants() {
-        // The vertex stage reads one, so a zero-byte range would be a mismatch
-        // between the shader and the layout.
-        assert_eq!(
-            ui_pipeline_desc().push_constant_bytes,
-            std::mem::size_of::<ScreenTransform>() as u32
-        );
+    fn the_pipeline_declares_no_push_constants() {
+        // naga 0.30 cannot parse a push constant in WGSL, so a non-zero range
+        // would be a range the shader can never read.
+        assert_eq!(ui_pipeline_desc().push_constant_bytes, 0);
     }
 
     #[test]
@@ -618,10 +706,22 @@ mod tests {
     }
 
     #[test]
-    fn the_shader_reads_the_transform_from_push_constants() {
-        // The transform is a push constant block, so the shader must not also
-        // declare it as a uniform at a binding, or the two disagree.
+    fn the_shader_reads_the_transform_from_a_uniform() {
+        // naga 0.30 cannot parse a push constant in WGSL, so the transform is a
+        // uniform buffer at binding 0 and the pipeline declares exactly that one
+        // set. The alternative — a declared set the shader never reads — makes
+        // every draw invalid, because Vulkan still requires it to be bound.
         assert!(UI_SHADER.contains("var<uniform> transform"));
+        assert!(UI_SHADER.contains("@group(0) @binding(0)"));
+    }
+
+    #[test]
+    fn the_shader_declares_exactly_one_descriptor() {
+        assert_eq!(
+            UI_SHADER.matches("@binding(").count(),
+            1,
+            "one binding, and the pipeline layout declares one set"
+        );
     }
 
     #[test]

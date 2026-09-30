@@ -2971,6 +2971,8 @@ dependencies = [
 name = "vibe-editor"
 version = "0.1.0"
 dependencies = [
+ "ash",
+ "bytemuck",
  "egui",
  "egui-winit",
  "glam 0.33.11",
@@ -2978,11 +2980,16 @@ dependencies = [
  "thiserror 2.0.21",
  "vibe-audio",
  "vibe-ecs",
+ "vibe-frame",
  "vibe-gltf",
  "vibe-math",
  "vibe-render",
  "vibe-rhi",
  "vibe-scene",
+ "vibe-shader",
+ "vibe-vk",
+ "vibe-window",
+ "winit",
 ]
 
 [[package]]

@@ -18,9 +18,9 @@
 use std::ffi::CStr;
 
 use ash::vk;
-use vibe_editor::{Editor, Panel, UiDrawData};
+use vibe_editor::{Editor, FontAtlas, Panel, UiDrawData};
 use vibe_render::ui::{ScreenTransform, UiBindGroup, build_ui_pipeline, scissor_from_bounds};
-use vibe_vk::memory::{BufferUsage, GpuBuffer, HeapLayout, MemoryNeed};
+use vibe_vk::memory::{BufferUsage, GpuBuffer, GpuImage, HeapLayout, ImageUsage, MemoryNeed};
 use vibe_window::{SurfaceKind, surface};
 
 /// How long to wait for the GPU, in nanoseconds.
@@ -88,10 +88,35 @@ struct Gpu {
     vertex_buffer: GpuBuffer,
     pool: vibe_frame::CommandPool,
     present_pool: vibe_frame::CommandPool,
+    /// A pool of its own for the font-atlas upload.
+    ///
+    /// Separate because the upload happens while the frame's pools have buffers
+    /// in the recording state, and beginning a buffer in a pool that still has
+    /// one open is what this driver crashes on.
+    atlas_pool: vibe_frame::CommandPool,
     resources: vibe_frame::FrameResources,
     heap: HeapLayout,
     rendering: ash::khr::dynamic_rendering::Device,
     sync2: ash::khr::synchronization2::Device,
+    /// The font atlas as a single-channel texture the UI shader samples.
+    ///
+    /// egui rasterises its font atlas once, into a single-channel coverage mask.
+    /// It arrives as an RGBA image whose other three channels are unused, so it
+    /// is reduced to one byte per texel and uploaded as `R8_UNORM`: sampling
+    /// the red channel of an RGBA atlas would work and would move four times
+    /// the bytes for a mask.
+    atlas: Option<GpuImage>,
+    /// A sampler for the atlas: linear, clamped.
+    ///
+    /// Linear because a glyph is magnified from a small atlas cell to the
+    /// screen size and nearest filtering makes it a staircase of hard pixels;
+    /// clamped because a UV outside the atlas should show the edge glyph rather
+    /// than wrap to a different letter.
+    atlas_sampler: vk::Sampler,
+    /// Staging for an atlas upload, sized to the largest atlas seen.
+    atlas_staging: GpuBuffer,
+    /// The atlas currently on the GPU, so an unchanged one is not re-uploaded.
+    uploaded_atlas: FontAtlas,
 }
 
 /// The running editor.
@@ -194,7 +219,7 @@ impl App {
         self.readback_done = true;
         // SAFETY: every object is live, and the swapchain matches the size
         // checked above because a resize rebuilds it before the next redraw.
-        unsafe { App::present(gpu, &data, w, h, readback) };
+        unsafe { App::present(gpu, &data, &data.atlas, w, h, readback) };
     }
 
     /// Record, submit and present the UI.
@@ -203,11 +228,21 @@ impl App {
     ///
     /// Every Vulkan object must be live and the swapchain must match the
     /// window's current size.
-    unsafe fn present(gpu: &mut Gpu, data: &UiDrawData, w: u32, h: u32, readback: bool) {
-        let device = &gpu.logical.device;
+    unsafe fn present(
+        gpu: &mut Gpu,
+        data: &UiDrawData,
+        atlas: &FontAtlas,
+        w: u32,
+        h: u32,
+        readback: bool,
+    ) {
+        // The atlas upload takes &mut gpu, so it runs before the device
+        // reference is taken for the rest of the frame.
         let Some(queue) = gpu.logical.graphics_queue() else {
             return;
         };
+        unsafe { upload_atlas(gpu, atlas, queue) };
+        let device = &gpu.logical.device;
 
         // Grow the vertex buffer when a frame needs more. Every batch is drawn
         // from one flat stream, so one buffer covers all of them.
@@ -759,11 +794,85 @@ impl App {
         transform_buffer
             .write_mapped(0, bytemuck::bytes_of(&transform))
             .map_err(|e| e.to_string())?;
+        // A 1x1 atlas to bind before egui has rasterised a real one, because
+        // the descriptor set has to name a view and the shader reads it on
+        // every draw whether or not there is text. The first frame replaces it.
+        //
+        // It has to be transitioned like any other texture the shader reads: a
+        // descriptor naming a view is a promise about the image's layout, and
+        // sampling an image left in UNDEFINED is what the validation layer
+        // reports here.
+        let atlas = GpuImage::create_2d(
+            device,
+            &heap,
+            1,
+            1,
+            vk::Format::R8G8B8A8_UNORM,
+            ImageUsage::texture(),
+            vk::ImageTiling::OPTIMAL,
+            vk::SampleCountFlags::TYPE_1,
+        )
+        .map_err(|e| e.to_string())?;
+        // Linear and clamped: a glyph is magnified out of a small atlas cell, so
+        // nearest filtering makes it a staircase, and a UV outside the atlas
+        // should show the edge rather than wrap to another letter.
+        let sampler_info = vk::SamplerCreateInfo {
+            mag_filter: vk::Filter::LINEAR,
+            min_filter: vk::Filter::LINEAR,
+            mipmap_mode: vk::SamplerMipmapMode::NEAREST,
+            address_mode_u: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            address_mode_w: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            max_lod: 0.0,
+            ..Default::default()
+        };
+        let atlas_sampler =
+            unsafe { device.create_sampler(&sampler_info, None) }.map_err(|e| e.to_string())?;
+
+        // Put the placeholder in the layout the descriptor names, so the frames
+        // before the real atlas arrives sample a defined image. A descriptor
+        // naming a view is a promise about that image's layout, and sampling one
+        // left in UNDEFINED is what the validation layer reports.
+        let Some(queue) = logical.graphics_queue() else {
+            return Err("no graphics queue for the placeholder atlas".to_string());
+        };
+        let atlas_pool =
+            vibe_frame::CommandPool::new(device, logical.graphics_family().unwrap_or(0), 1)
+                .map_err(|e| e.to_string())?;
+        let atlas_cmd = atlas_pool.begin(device, 0).map_err(|e| e.to_string())?;
+        let mut atlas_enc = vibe_vk::BarrierEncoder::for_tier(logical.sync_tier());
+        atlas_enc.push(
+            vibe_vk::Barrier::image(atlas.image(), vk::ImageAspectFlags::COLOR)
+                .layouts(
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                )
+                .src(vibe_vk::Stage::None, vibe_vk::Access::None)
+                .dst(vibe_vk::Stage::FragmentShader, vibe_vk::Access::ShaderRead),
+        );
+        atlas_enc.record(device, &sync2, atlas_cmd);
+        atlas_pool.end(device, 0).map_err(|e| e.to_string())?;
+        let atlas_batch = vibe_frame::SubmitBatch::single(atlas_cmd, vibe_frame::SubmitSync::None);
+        let atlas_sub = vibe_frame::build_submit_info(&atlas_batch);
+        let atlas_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+            .map_err(|e| e.to_string())?;
+        unsafe {
+            sync2
+                .queue_submit2(queue, &[atlas_sub.info], atlas_fence)
+                .map_err(|e| e.to_string())?;
+            device
+                .wait_for_fences(&[atlas_fence], true, TIMEOUT)
+                .map_err(|e| e.to_string())?;
+            device.destroy_fence(atlas_fence, None);
+        }
+
         let bind_group = UiBindGroup::create(
             device,
             pipeline.descriptor_layout,
             transform_buffer.buffer(),
             std::mem::size_of::<ScreenTransform>() as u64,
+            atlas.view(),
+            atlas_sampler,
         )
         .map_err(|e| e.to_string())?;
 
@@ -798,6 +907,26 @@ impl App {
         // than waiting for a resize that may never come.
         resources.resize_present_semaphores(device, images.len());
 
+        // Built before the struct literal, because the heap is moved into it
+        // and the staging needs a borrow of the heap to be allocated.
+        // Built before the struct literal, because the heap and the device are
+        // moved into it and the staging needs to borrow both.
+        let atlas_pool =
+            vibe_frame::CommandPool::new(device, logical.graphics_family().unwrap_or(0), 1)
+                .map_err(|e| e.to_string())?;
+        let mut atlas_staging = GpuBuffer::create(
+            device,
+            &heap,
+            1024 * 1024,
+            BufferUsage {
+                transfer_src: true,
+                ..Default::default()
+            },
+            MemoryNeed::upload(),
+        )
+        .map_err(|e| e.to_string())?;
+        atlas_staging.map(device).map_err(|e| e.to_string())?;
+
         Ok(Setup {
             gpu: Gpu {
                 logical,
@@ -813,10 +942,17 @@ impl App {
                 vertex_buffer,
                 pool,
                 present_pool,
+                atlas_pool,
                 resources,
                 heap,
                 rendering,
                 sync2,
+                atlas: Some(atlas),
+                atlas_sampler,
+                // Sized for a first atlas and grown if a later one is larger;
+                // egui's is fixed once the fonts are loaded.
+                atlas_staging,
+                uploaded_atlas: FontAtlas::default(),
             },
             messenger,
             surface: vk_surface,
@@ -825,6 +961,174 @@ impl App {
 }
 
 /// Copy the rendered image out and count the pixels that are not the clear.
+/// Upload the font atlas when egui has rasterised a new one.
+///
+/// egui rasterises its atlas once and reuses it, so this runs on the first
+/// frame and after a font change, not every frame. The image is recreated
+/// because egui can grow it, and a bind group naming a view of the old image
+/// would sample freed memory.
+///
+/// # Safety
+///
+/// The device must be live and the bind group is rebuilt before any draw.
+/// Upload the font atlas when egui has rasterised a new one.
+///
+/// egui rasterises its atlas once and reuses it, so this runs on the first
+/// frame that has a GPU and after a font change. The image is recreated
+/// because egui can grow it, and a bind group naming a view of the old image
+/// would sample freed memory.
+///
+/// # Safety
+///
+/// The device must be live and the bind group is rebuilt before any draw.
+unsafe fn upload_atlas(gpu: &mut Gpu, atlas: &FontAtlas, queue: vk::Queue) {
+    let device = &gpu.logical.device;
+    if atlas.is_empty() || atlas == &gpu.uploaded_atlas {
+        return;
+    }
+
+    let need = atlas.byte_len() as u64;
+    if gpu.atlas_staging.size() < need {
+        let bigger = unsafe {
+            GpuBuffer::create(
+                device,
+                &gpu.heap,
+                need.next_power_of_two(),
+                BufferUsage {
+                    transfer_src: true,
+                    ..Default::default()
+                },
+                MemoryNeed::upload(),
+            )
+        };
+        let Ok(mut bigger) = bigger else {
+            eprintln!("FAIL growing the atlas staging buffer to {need} bytes");
+            return;
+        };
+        if unsafe { bigger.map(device) }.is_err() {
+            eprintln!("FAIL mapping the grown atlas staging buffer");
+            return;
+        }
+        gpu.atlas_staging = bigger;
+    }
+    if gpu.atlas_staging.write_mapped(0, &atlas.pixels).is_err() {
+        eprintln!("FAIL staging the font atlas");
+        return;
+    }
+
+    // A new image each time, because egui can grow the atlas and a bind group
+    // naming a view of the old one would sample freed memory.
+    let image = match unsafe {
+        GpuImage::create_2d(
+            device,
+            &gpu.heap,
+            atlas.width,
+            atlas.height,
+            vk::Format::R8G8B8A8_UNORM,
+            ImageUsage::texture(),
+            vk::ImageTiling::OPTIMAL,
+            vk::SampleCountFlags::TYPE_1,
+        )
+    } {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("FAIL creating the atlas image: {e}");
+            return;
+        }
+    };
+
+    // The atlas pool is its own: the frame's pools have buffers in the
+    // recording state, and beginning a buffer in a pool that still has one open
+    // is what this driver crashes on.
+    if gpu.atlas_pool.reset(device).is_err() {
+        eprintln!("FAIL resetting the atlas pool");
+        return;
+    }
+    let Ok(cmd) = (unsafe { gpu.atlas_pool.begin(device, 0) }) else {
+        eprintln!("FAIL beginning the atlas upload");
+        return;
+    };
+    unsafe {
+        let mut enc = vibe_vk::BarrierEncoder::for_tier(gpu.logical.sync_tier());
+        enc.push(
+            vibe_vk::Barrier::image(image.image(), vk::ImageAspectFlags::COLOR)
+                .layouts(
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                )
+                .src(vibe_vk::Stage::None, vibe_vk::Access::None)
+                .dst(vibe_vk::Stage::Transfer, vibe_vk::Access::TransferWrite),
+        );
+        enc.record(device, &gpu.sync2, cmd);
+        if image
+            .record_upload(device, cmd, gpu.atlas_staging.buffer())
+            .is_err()
+        {
+            eprintln!("FAIL recording the atlas upload");
+            return;
+        }
+        let mut enc2 = vibe_vk::BarrierEncoder::for_tier(gpu.logical.sync_tier());
+        enc2.push(
+            vibe_vk::Barrier::image(image.image(), vk::ImageAspectFlags::COLOR)
+                .layouts(
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                )
+                .src(vibe_vk::Stage::Transfer, vibe_vk::Access::TransferWrite)
+                .dst(vibe_vk::Stage::FragmentShader, vibe_vk::Access::ShaderRead),
+        );
+        enc2.record(device, &gpu.sync2, cmd);
+    }
+    if unsafe { gpu.atlas_pool.end(device, 0) }.is_err() {
+        eprintln!("FAIL ending the atlas upload");
+        return;
+    }
+    let batch = vibe_frame::SubmitBatch::single(cmd, vibe_frame::SubmitSync::None);
+    let sub = vibe_frame::build_submit_info(&batch);
+    let Ok(fence) = (unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }) else {
+        return;
+    };
+    if unsafe { gpu.sync2.queue_submit2(queue, &[sub.info], fence) }.is_err() {
+        unsafe { device.destroy_fence(fence, None) };
+        return;
+    }
+    let _ = unsafe { device.wait_for_fences(&[fence], true, TIMEOUT) };
+    unsafe { device.destroy_fence(fence, None) };
+
+    // Swap in the new atlas and rebind, so the draws that follow sample it.
+    if let Some(mut old) = gpu.atlas.replace(image) {
+        unsafe { old.destroy(device) };
+    }
+    gpu.uploaded_atlas = atlas.clone();
+    let view = gpu
+        .atlas
+        .as_ref()
+        .map(|a| a.view())
+        .unwrap_or(vk::ImageView::null());
+    let bound = unsafe {
+        UiBindGroup::create(
+            device,
+            gpu.pipeline.descriptor_layout,
+            gpu.transform_buffer.buffer(),
+            std::mem::size_of::<ScreenTransform>() as u64,
+            view,
+            gpu.atlas_sampler,
+        )
+    };
+    let Ok(bound) = bound else {
+        eprintln!("FAIL rebuilding the bind group for the new atlas");
+        return;
+    };
+    unsafe { gpu.bind_group.destroy(device) };
+    gpu.bind_group = bound;
+    println!(
+        "[atlas] uploaded {}x{}, {} bytes",
+        atlas.width,
+        atlas.height,
+        atlas.pixels.len()
+    );
+}
+
 /// Copy the rendered image out and count the pixels that are not the clear.
 ///
 /// Takes a command pool from the caller rather than creating one. Creating a

@@ -853,9 +853,21 @@ impl GpuImage {
         Ok(())
     }
 
-    /// Bytes an image of this size needs for an RGBA8 upload.
+    /// Bytes an image of this size needs for a tightly packed upload.
+    ///
+    /// Format-aware, because the copy itself is not: a single-channel atlas
+    /// needs one byte per texel and an RGBA image needs four, and using four for
+    /// both over-reads the staging buffer by a factor of four.
     pub fn upload_size(&self) -> u64 {
-        (self.width as u64) * (self.height as u64) * 4
+        (self.width as u64) * (self.height as u64) * self.bytes_per_texel()
+    }
+
+    /// Bytes one texel of this image's format occupies in a packed upload.
+    pub fn bytes_per_texel(&self) -> u64 {
+        match self.format {
+            vk::Format::R8_UNORM => 1,
+            _ => 4,
+        }
     }
 
     /// Destroy the view, image and memory.

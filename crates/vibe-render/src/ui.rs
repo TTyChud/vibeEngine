@@ -36,6 +36,13 @@ pub struct UiVertex {
     pub position: [f32; 2],
     /// Premultiplied RGBA, each byte 0..255.
     pub color: [u8; 4],
+    /// Texture coordinate into the font atlas.
+    ///
+    /// A glyph is a triangle strip shaped like a letter, so without this the
+    /// only way to draw text is as a solid quad per glyph, and every character
+    /// comes out a coloured block. This is what lets the fragment stage sample
+    /// the atlas and cut the letter out of it.
+    pub uv: [f32; 2],
 }
 
 /// Bytes one UI vertex occupies.
@@ -48,6 +55,7 @@ pub fn ui_vertex_layout() -> VertexLayout {
         vec![
             Attribute::new(0, 0, VertexFormat::Float2),
             Attribute::new(1, 8, VertexFormat::Unorm8x4),
+            Attribute::new(2, 12, VertexFormat::Float2),
         ],
     )
 }
@@ -63,11 +71,13 @@ pub const UI_SHADER: &str = r#"
 struct UiVertex {
     @location(0) position: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) uv: vec2<f32>,
 }
 
 struct VertexOut {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) uv: vec2<f32>,
 }
 
 struct Pixels {
@@ -81,6 +91,8 @@ struct Pixels {
 // written that way does not parse at all. The quad pipeline already takes its
 // camera the same way, so this is also the shape the project is used to.
 @group(0) @binding(0) var<uniform> transform: Pixels;
+@group(0) @binding(1) var font_atlas: texture_2d<f32>;
+@group(0) @binding(2) var atlas_sampler: sampler;
 
 @vertex
 fn vs_main(vertex: UiVertex) -> VertexOut {
@@ -93,12 +105,18 @@ fn vs_main(vertex: UiVertex) -> VertexOut {
         1.0,
     );
     out.color = vertex.color;
+    out.uv = vertex.uv;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    return in.color;
+    // The atlas is a single-channel coverage mask, so the red channel is the
+    // glyph's alpha. Multiplying the vertex colour by it is what cuts a letter
+    // out of its quad: without this every glyph is a solid block of the text
+    // colour, which is exactly what text looked like before.
+    let coverage = textureSample(font_atlas, atlas_sampler, in.uv).r;
+    return in.color * coverage;
 }
 "#;
 
@@ -107,11 +125,13 @@ pub const VERTEX_ENTRY: &str = "vs_main";
 /// The name of the fragment entry point.
 pub const FRAGMENT_ENTRY: &str = "fs_main";
 
-/// The descriptor bindings the UI shader uses. It uses none: the transform is
-/// a push constant and the fragment stage returns the vertex colour, so the
-/// pipeline layout declares no set at all. These are kept because a future
-/// textured UI panel would reintroduce them, and because a declared-but-unbound
-/// set is what makes a draw invalid rather than merely wasteful.
+/// The descriptor bindings the UI shader uses: the screen transform, the font
+/// atlas and its sampler.
+///
+/// All three must be bound on every draw, including draws with no text in them:
+/// Vulkan requires a set to be bound for every set the pipeline statically uses,
+/// so declaring one and not binding it makes the draw invalid rather than
+/// merely wasteful.
 pub const TRANSFORM_BINDING: u32 = 0;
 /// The font atlas texture, for a panel that draws one.
 pub const ATLAS_BINDING: u32 = 1;
@@ -258,13 +278,29 @@ pub unsafe fn build_ui_pipeline<C: ShaderCompiler>(
         // at binding 0. Declaring a set the shader does not use is not merely
         // wasteful: Vulkan requires every statically-used set to be bound at
         // draw time, so a declared-but-unbound set makes the draw invalid.
-        let bindings = [vk::DescriptorSetLayoutBinding {
-            binding: TRANSFORM_BINDING,
-            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-            descriptor_count: 1,
-            stage_flags: vk::ShaderStageFlags::VERTEX,
-            ..Default::default()
-        }];
+        let bindings = [
+            vk::DescriptorSetLayoutBinding {
+                binding: TRANSFORM_BINDING,
+                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::VERTEX,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: ATLAS_BINDING,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: SAMPLER_BINDING,
+                descriptor_type: vk::DescriptorType::SAMPLER,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                ..Default::default()
+            },
+        ];
         let layout_info = vk::DescriptorSetLayoutCreateInfo {
             binding_count: bindings.len() as u32,
             p_bindings: bindings.as_ptr(),
@@ -475,11 +511,25 @@ impl UiBindGroup {
         layout: vk::DescriptorSetLayout,
         buffer: vk::Buffer,
         range: vk::DeviceSize,
+        atlas_view: vk::ImageView,
+        sampler: vk::Sampler,
     ) -> Result<UiBindGroup, RenderError> {
-        let pool_sizes = [vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::UNIFORM_BUFFER,
-            descriptor_count: 1,
-        }];
+        // All three types in one pool: the set needs one of each, and a pool
+        // missing a type fails at allocate time rather than at update.
+        let pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: 1,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLER,
+                descriptor_count: 1,
+            },
+        ];
         let pool_info = vk::DescriptorPoolCreateInfo {
             max_sets: 1,
             pool_size_count: pool_sizes.len() as u32,
@@ -506,15 +556,38 @@ impl UiBindGroup {
             offset: 0,
             range,
         }];
-        let write = vk::WriteDescriptorSet {
-            dst_set: sets[0],
-            dst_binding: TRANSFORM_BINDING,
-            descriptor_count: 1,
-            p_buffer_info: info.as_ptr(),
-            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-            ..Default::default()
-        };
-        unsafe { device.update_descriptor_sets(&[write], &[]) };
+        let image_info = [vk::DescriptorImageInfo {
+            sampler,
+            image_view: atlas_view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        let writes = [
+            vk::WriteDescriptorSet {
+                dst_set: sets[0],
+                dst_binding: TRANSFORM_BINDING,
+                descriptor_count: 1,
+                p_buffer_info: info.as_ptr(),
+                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                ..Default::default()
+            },
+            vk::WriteDescriptorSet {
+                dst_set: sets[0],
+                dst_binding: ATLAS_BINDING,
+                descriptor_count: 1,
+                p_image_info: image_info.as_ptr(),
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                ..Default::default()
+            },
+            vk::WriteDescriptorSet {
+                dst_set: sets[0],
+                dst_binding: SAMPLER_BINDING,
+                descriptor_count: 1,
+                p_image_info: image_info.as_ptr(),
+                descriptor_type: vk::DescriptorType::SAMPLER,
+                ..Default::default()
+            },
+        ];
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
         Ok(UiBindGroup { set: sets[0], pool })
     }
 
@@ -544,9 +617,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_ui_vertex_is_12_bytes() {
-        assert_eq!(std::mem::size_of::<UiVertex>(), 12);
-        assert_eq!(UI_VERTEX_SIZE, 12);
+    fn a_ui_vertex_is_20_bytes() {
+        // 8 of position, 4 of colour, 8 of uv. The uv is what makes a glyph a
+        // glyph: without it the only way to draw text is a solid quad per
+        // character.
+        assert_eq!(std::mem::size_of::<UiVertex>(), 20);
+        assert_eq!(UI_VERTEX_SIZE, 20);
     }
 
     #[test]
@@ -554,15 +630,16 @@ mod tests {
         let v = UiVertex {
             position: [1.0, 2.0],
             color: [3, 4, 5, 6],
+            uv: [0.5, 0.5],
         };
         assert_eq!(bytemuck::bytes_of(&v).len(), UI_VERTEX_SIZE as usize);
     }
 
     #[test]
-    fn the_layout_places_both_attributes_inside_the_stride() {
+    fn the_layout_places_all_three_attributes_inside_the_stride() {
         let l = ui_vertex_layout();
         assert_eq!(l.stride, UI_VERTEX_SIZE);
-        assert_eq!(l.locations(), vec![0, 1]);
+        assert_eq!(l.locations(), vec![0, 1, 2]);
         assert!(
             l.used_bytes() <= l.stride,
             "an attribute must not reach past the stride"
@@ -576,8 +653,8 @@ mod tests {
 
     #[test]
     fn the_layout_has_no_padding_hole() {
-        // The fields add up to the stride exactly, so there is no tail padding
-        // for a bytemuck cast to expose.
+        // 8 of position plus 4 of colour plus 8 of uv is the whole stride, so
+        // there is no tail padding for a bytemuck cast to expose.
         assert!(!ui_vertex_layout().has_padding());
     }
 
@@ -588,7 +665,9 @@ mod tests {
         assert_eq!(a[0].offset, 0);
         assert_eq!(a[0].format.size(), 8);
         assert_eq!(a[1].offset, 8, "the colour follows the position");
+        assert_eq!(a[2].offset, 12, "the uv follows the colour");
         assert!(a[0].offset + a[0].format.size() <= a[1].offset);
+        assert!(a[1].offset + a[1].format.size() <= a[2].offset);
     }
 
     #[test]
@@ -716,22 +795,30 @@ mod tests {
     }
 
     #[test]
-    fn the_shader_declares_exactly_one_descriptor() {
+    fn the_shader_declares_exactly_three_descriptors() {
+        // The transform, the atlas and the sampler. All three are bound on
+        // every draw: Vulkan requires a set to be bound for every set the
+        // pipeline statically uses, so a draw that leaves one unbound is
+        // invalid rather than merely wrong.
         assert_eq!(
             UI_SHADER.matches("@binding(").count(),
-            1,
-            "one binding, and the pipeline layout declares one set"
+            3,
+            "transform, atlas and sampler"
         );
     }
 
     #[test]
-    fn the_shader_samples_no_texture() {
-        // The fragment stage returns the vertex colour directly. Sampling an
-        // unbound font atlas here would fault on drivers that do not tolerate
-        // it, and the glyphs are already rasterised into the vertices by egui.
+    fn the_shader_samples_the_atlas() {
+        // The fragment stage multiplies the vertex colour by the atlas coverage.
+        // A shader that returned the colour alone drew every glyph as a solid
+        // block, which is what text looked like before this existed.
         assert!(
-            !UI_SHADER.contains("textureSample"),
-            "the fragment stage must not sample"
+            UI_SHADER.contains("textureSample"),
+            "the fragment stage must sample the font atlas"
+        );
+        assert!(
+            UI_SHADER.contains("* coverage"),
+            "and the coverage must scale the vertex colour"
         );
     }
 }

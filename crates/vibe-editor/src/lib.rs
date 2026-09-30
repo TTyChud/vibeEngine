@@ -29,6 +29,6 @@ pub use hierarchy::{HierarchyPanel, Selection};
 pub use inspector::{FieldEdit, FieldValue, InspectorPanel};
 pub use logs::{LogLevel, LogPanel, LogSink};
 pub use session::{EditorMode, EditorSession, FileAction, SessionError};
-pub use ui_bridge::UiDrawData;
+pub use ui_bridge::{FontAtlas, UiDrawData};
 pub use vibe_render::ui::UiVertex;
 pub use viewport::Viewport;

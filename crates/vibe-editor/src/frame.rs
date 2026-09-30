@@ -95,6 +95,8 @@ pub struct EditorFrame<'a> {
     /// and cleared, so a path left here by a host that crashed does not reopen
     /// the same scene on every subsequent frame.
     pub requested_path: &'a mut Option<std::path::PathBuf>,
+    /// The font atlas last seen, carried across the frames egui sends none for.
+    pub last_atlas: &'a mut crate::ui_bridge::FontAtlas,
 }
 
 impl EditorFrame<'_> {
@@ -121,11 +123,21 @@ impl EditorFrame<'_> {
                 self.draw_viewport(ui);
             }));
         });
-        let data = UiDrawData::from_output(self.context, &output);
-        // The font atlas egui rasterised is released rather than uploaded: this
-        // backend draws coloured triangles and samples nothing, and egui
-        // asserts on a delta that is dropped unapplied. Clearing it is the
-        // documented way to say "deliberately not applying these".
+        // The font atlas is read out of the delta before it is cleared: the
+        // glyph meshes reference it by UV, so discarding it is what left every
+        // character drawn as a solid block.
+        // egui rasterises its font atlas once and then sends no delta at all, so
+        // the last one seen is kept and handed on every frame. A frame that runs
+        // before the GPU exists would otherwise be the one carrying the atlas,
+        // and its geometry would never be drawn.
+        let mut data = UiDrawData::from_output(self.context, &output);
+        let fresh = UiDrawData::font_atlas(&output);
+        if !fresh.is_empty() {
+            *self.last_atlas = fresh.clone();
+        }
+        data.atlas = self.last_atlas.clone();
+        // The delta is cleared rather than applied: this backend uploads the
+        // atlas itself, and epaint asserts on a delta dropped unapplied.
         let mut output = output;
         output.textures_delta.clear();
         data
@@ -445,6 +457,12 @@ pub struct Editor {
     pub camera: crate::camera::EditorCamera,
     /// A path the host wants opened, consumed on the next frame.
     pub requested_path: Option<std::path::PathBuf>,
+    /// The font atlas last seen from egui.
+    ///
+    /// egui rasterises it once and sends no delta on any later frame, so
+    /// keeping it here is what lets a frame that runs before the GPU exists not
+    /// be the only frame that ever has one.
+    pub last_atlas: crate::ui_bridge::FontAtlas,
     /// How many frames have been drawn, for the status line.
     pub frame_count: u64,
 }
@@ -484,6 +502,7 @@ impl Editor {
             viewport: crate::viewport::Viewport::new(),
             camera: crate::camera::EditorCamera::perspective(),
             requested_path: None,
+            last_atlas: crate::ui_bridge::FontAtlas::default(),
             frame_count: 0,
         }
     }
@@ -503,6 +522,7 @@ impl Editor {
             scene_viewport: &mut self.viewport,
             camera: &self.camera,
             requested_path: &mut self.requested_path,
+            last_atlas: &mut self.last_atlas,
         }
     }
 
@@ -621,6 +641,7 @@ mod tests {
             scene_viewport: crate::viewport::Viewport::new(),
             camera: crate::camera::EditorCamera::perspective(),
             requested_path: None,
+            last_atlas: crate::ui_bridge::FontAtlas::default(),
         }
     }
 
@@ -635,6 +656,7 @@ mod tests {
         scene_viewport: crate::viewport::Viewport,
         camera: crate::camera::EditorCamera,
         requested_path: Option<std::path::PathBuf>,
+        last_atlas: crate::ui_bridge::FontAtlas,
     }
 
     impl Parts {
@@ -652,6 +674,7 @@ mod tests {
                 camera: &self.camera,
                 world: &mut self.world,
                 requested_path: &mut self.requested_path,
+                last_atlas: &mut self.last_atlas,
             }
         }
     }

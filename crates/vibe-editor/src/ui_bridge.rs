@@ -31,6 +31,38 @@ impl UiBatch {
     }
 }
 
+/// The font atlas egui rasterised this frame.
+///
+/// A coverage mask: the red channel of each texel is the glyph's alpha. Stored
+/// as RGBA8 because that is the format the engine's other textures use and
+/// `R8_UNORM` needs a feature this device does not report.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FontAtlas {
+    /// The atlas width in pixels.
+    pub width: u32,
+    /// The atlas height in pixels.
+    pub height: u32,
+    /// RGBA8 texels, row by row from the top.
+    pub pixels: Vec<u8>,
+}
+
+impl FontAtlas {
+    /// True when there is nothing to upload.
+    pub fn is_empty(&self) -> bool {
+        self.pixels.is_empty() || self.width == 0 || self.height == 0
+    }
+
+    /// Bytes a row occupies, which is four per texel.
+    pub fn stride(&self) -> usize {
+        self.width as usize * 4
+    }
+
+    /// Bytes a full upload of this atlas needs.
+    pub fn byte_len(&self) -> usize {
+        self.stride() * self.height as usize
+    }
+}
+
 /// One frame's UI geometry, ready to upload.
 #[derive(Debug, Clone, Default)]
 pub struct UiDrawData {
@@ -40,9 +72,66 @@ pub struct UiDrawData {
     pub clipped: usize,
     /// How many triangles were skipped for exceeding the vertex cap.
     pub dropped: usize,
+    /// The font atlas, when egui rasterised one this frame.
+    ///
+    /// Empty on every frame after the first, because egui rasterises the atlas
+    /// once and reuses it. A renderer that uploads whenever this is non-empty
+    /// therefore uploads once — which is also why the atlas has to be kept by
+    /// the caller rather than taken from here: the frame that carries it is
+    /// whichever one egui rasterised on, and a frame that runs before the GPU
+    /// exists would otherwise lose it with nothing to replace it.
+    pub atlas: FontAtlas,
 }
 
 impl UiDrawData {
+    /// The font atlas egui rasterised, if it rasterised one this frame.
+    ///
+    /// egui's font texture is a single-channel coverage mask delivered as an
+    /// RGBA image, so the red channel is the glyph alpha and the other three
+    /// are unused. It is reduced to one byte per texel here because that is what
+    /// an `R8_UNORM` upload wants, and uploading RGBA would be four times the
+    /// bandwidth for a mask the shader only ever reads one channel of.
+    pub fn font_atlas(output: &egui::FullOutput) -> FontAtlas {
+        // Managed(0) is the font texture: epaint's first managed slot is
+        // where the atlas lives, and it is the default so `Managed(0)` is
+        // exactly right rather than a guess.
+        let id = egui::TextureId::Managed(0);
+        let Some(deltas) = output.textures_delta.set.get(&id) else {
+            return FontAtlas::default();
+        };
+        // A patch rather than a whole image would need the previous contents to
+        // patch into, which a backend that keeps its own atlas copy has and one
+        // that does not does not; the whole image is the case that matters.
+        let Some(delta) = deltas.last() else {
+            return FontAtlas::default();
+        };
+        if delta.pos.is_some() {
+            return FontAtlas::default();
+        }
+        // One variant, so this always binds; a second would arrive as a new
+        // enum variant and this would need to handle it.
+        let egui::epaint::ImageData::Color(image) = &delta.image;
+        let [w, h] = image.size;
+        if w == 0 || h == 0 {
+            return FontAtlas::default();
+        }
+        let raw = image.as_raw();
+        let mut pixels = Vec::with_capacity(w * h * 4);
+        for texel in raw.chunks_exact(4) {
+            // The coverage goes in every channel rather than only red. R8_UNORM
+            // as a sampled image needs a feature this device does not report,
+            // and creating one crashes the driver; RGBA8 is what the engine
+            // already samples, and the shader reads red either way. The cost is
+            // four bytes per texel of an atlas that is written once.
+            pixels.extend_from_slice(texel);
+        }
+        FontAtlas {
+            width: w as u32,
+            height: h as u32,
+            pixels,
+        }
+    }
+
     /// Nothing to draw.
     pub fn is_empty(&self) -> bool {
         self.batches.iter().all(|b| b.is_empty())
@@ -210,6 +299,9 @@ fn vertex_from(v: &Vertex) -> UiVertex {
     UiVertex {
         position: [v.pos.x, v.pos.y],
         color: v.color.to_array(),
+        // The glyph's coordinate in the font atlas. Without it the fragment
+        // stage has nothing to sample and every character draws as a solid quad.
+        uv: [v.uv.x, v.uv.y],
     }
 }
 
@@ -318,6 +410,16 @@ mod tests {
         let out = vertex_from(&v);
         assert_eq!(out.position, [3.0, 4.0]);
         assert_eq!(out.color, [10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn a_vertex_keeps_its_texture_coordinate() {
+        let v = Vertex {
+            pos: Pos2::new(1.0, 2.0),
+            uv: Pos2::new(0.25, 0.75),
+            color: egui::Color32::WHITE,
+        };
+        assert_eq!(vertex_from(&v).uv, [0.25, 0.75]);
     }
 
     #[test]

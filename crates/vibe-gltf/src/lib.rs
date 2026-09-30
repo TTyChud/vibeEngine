@@ -9,6 +9,7 @@ pub mod error;
 pub mod loader;
 pub mod mesh;
 pub mod sprite;
+pub mod text;
 
 pub use anim::{
     Channel, ChannelPath, ChannelValue, Clip, Interpolation, Keyframe, LoopMode, Playback,
@@ -23,4 +24,8 @@ pub use mesh::{
 pub use sprite::{
     FrameRect, SheetClock, SheetDesc, SheetLayout, grid_frames, slice, strip_frames_horizontal,
     strip_frames_vertical, validate_sheet,
+};
+pub use text::{
+    AtlasRect, CHANNELS, EM_DISTANCE_RANGE, GlyphEntry, GlyphRun, MsdfAtlas, MsdfFont, PlacedGlyph,
+    TextAlign, TextDirection, align_run, layout, layout_with_direction,
 };

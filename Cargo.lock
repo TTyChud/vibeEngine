@@ -2293,6 +2293,7 @@ dependencies = [
 name = "vibe-gltf"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "bytemuck",
  "glam 0.33.11",
  "gltf",

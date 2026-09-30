@@ -205,14 +205,44 @@ impl QuadRenderer {
         [
             // undefined -> colour attachment, before the pass
             Barrier::image(target, vk::ImageAspectFlags::COLOR)
+                .layouts(
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                )
                 .src(Stage::None, Access::None)
                 .dst(Stage::ColorAttachmentOutput, Access::ColorAttachmentWrite),
             // colour attachment -> present, after the pass. A swapchain image
             // must end in PRESENT_SRC_KHR or vkQueuePresentKHR is invalid.
             Barrier::image(target, vk::ImageAspectFlags::COLOR)
+                .layouts(
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                )
                 .src(Stage::ColorAttachmentOutput, Access::ColorAttachmentWrite)
                 .dst(Stage::None, Access::None),
         ]
+    }
+
+    /// The barrier that puts an acquired swapchain image into the layout
+    /// [`QuadRenderer::record`] expects.
+    ///
+    /// The two have to agree: the pass declares the attachment's layout and the
+    /// barrier leaves the image in it, so a mismatch is what the validation
+    /// layer reports as "expected COLOR_ATTACHMENT_OPTIMAL but previous known
+    /// layout is GENERAL".
+    pub fn acquire_barrier(target: vk::Image) -> Barrier {
+        Barrier::image(target, vk::ImageAspectFlags::COLOR)
+            .layouts(
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            )
+            // The source stage is the colour attachment output, not nothing:
+            // `vkAcquireNextImageKHR` makes the image available there, and a
+            // layout transition with an empty srcStageMask creates no
+            // execution dependency against it, which sync validation reports
+            // as a WRITE_AFTER_READ hazard.
+            .src(Stage::ColorAttachmentOutput, Access::None)
+            .dst(Stage::ColorAttachmentOutput, Access::ColorAttachmentWrite)
     }
 
     /// Record the frame's barriers into an encoder.

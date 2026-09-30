@@ -290,9 +290,16 @@ impl LogicalDevice {
         let want_timeline = supported12.timeline_semaphore == vk::TRUE;
         let want_sync2 = supported13.synchronization2 == vk::TRUE;
         let want_dynamic_rendering = supported13.dynamic_rendering == vk::TRUE;
+        // Descriptor indexing arrives as an extension, so enabling the
+        // extension name is only half of it: the feature bit has to be set too
+        // or vkCreateDevice is invalid. The partial-bindless path the batch
+        // renderer uses needs a runtime array of partially-bound descriptors.
+        let want_descriptor_indexing = supported12.descriptor_indexing == vk::TRUE;
+        let want_runtime_array = supported12.runtime_descriptor_array == vk::TRUE;
+        let want_partially_bound = supported12.descriptor_binding_partially_bound == vk::TRUE;
         log::info!(
             "device features: timeline={want_timeline} synchronization2={want_sync2} \
-             dynamic_rendering={want_dynamic_rendering}"
+             dynamic_rendering={want_dynamic_rendering} descriptor_indexing={want_descriptor_indexing}"
         );
 
         // Without these the driver ignores the dynamic viewport and falls back
@@ -346,6 +353,23 @@ impl LogicalDevice {
         };
         let mut features12 = vk::PhysicalDeviceVulkan12Features {
             timeline_semaphore: if want_timeline { vk::TRUE } else { vk::FALSE },
+            // The extension name is already in the list; without the feature
+            // bit the create call is invalid rather than merely unused.
+            descriptor_indexing: if want_descriptor_indexing {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
+            runtime_descriptor_array: if want_runtime_array {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
+            descriptor_binding_partially_bound: if want_partially_bound {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
             ..Default::default()
         };
         features12.p_next = &mut features13 as *mut _ as *mut _;

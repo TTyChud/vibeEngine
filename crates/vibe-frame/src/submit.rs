@@ -40,6 +40,28 @@ pub enum SubmitSync {
         /// Signalled when this frame's rendering is done.
         signal: vk::Semaphore,
     },
+    /// A complete swapchain frame: wait for the previous frame's timeline
+    /// value and for the WSI's acquire semaphore, signal the next timeline
+    /// value and the present semaphore.
+    ///
+    /// This exists because the two kinds of wait are not interchangeable. The
+    /// pacing wait is a timeline value, which keeps the CPU from running ahead
+    /// of the GPU; the acquire wait is a binary semaphore, because
+    /// `vkAcquireNextImageKHR` has no value field. Using one for the other
+    /// produces a submission that waits on a signal nobody ever sends, which
+    /// hangs on the fence rather than reporting an error.
+    Paced {
+        /// The timeline semaphore every frame shares.
+        timeline: vk::Semaphore,
+        /// Wait until the timeline reaches this: the previous frame's value.
+        wait_value: TimelineValue,
+        /// Signalled by `vkAcquireNextImageKHR` when the image is ready.
+        acquire: vk::Semaphore,
+        /// Signalled for `vkQueuePresentKHR` to wait on.
+        signal: vk::Semaphore,
+        /// Raise the timeline to this when the frame is done.
+        signal_value: TimelineValue,
+    },
 }
 
 impl SubmitSync {
@@ -47,7 +69,7 @@ impl SubmitSync {
     pub fn waits(&self) -> bool {
         matches!(
             self,
-            SubmitSync::Binary { .. } | SubmitSync::Timeline { .. }
+            SubmitSync::Binary { .. } | SubmitSync::Timeline { .. } | SubmitSync::Paced { .. }
         )
     }
 
@@ -57,21 +79,35 @@ impl SubmitSync {
     }
 
     /// The semaphore this waits on, if any.
+    ///
+    /// A [`SubmitSync::Paced`] waits on two; this reports the acquire
+    /// semaphore, which is the one the frame's work actually depends on.
     pub fn wait_semaphore(&self) -> Option<vk::Semaphore> {
-        match self {
-            SubmitSync::Binary { wait, .. } => Some(*wait),
-            SubmitSync::Timeline { semaphore, .. } => Some(*semaphore),
-            _ => None,
-        }
+        self.wait_infos().first().map(|i| i.semaphore)
     }
 
     /// The semaphore this signals, if any.
     pub fn signal_semaphore(&self) -> Option<vk::Semaphore> {
+        self.signal_infos().first().map(|i| i.semaphore)
+    }
+
+    /// The binary semaphore `vkAcquireNextImageKHR` signals, if this frame has
+    /// one. The timeline semaphore is deliberately not reported here: the WSI
+    /// calls take no value and reject a timeline semaphore.
+    pub fn acquire_binary(&self) -> Option<vk::Semaphore> {
         match self {
-            SubmitSync::Binary { signal, .. } => Some(*signal),
-            SubmitSync::SignalOnly { signal } => Some(*signal),
-            SubmitSync::None => None,
-            SubmitSync::Timeline { .. } => None,
+            SubmitSync::Binary { wait, .. } => Some(*wait),
+            SubmitSync::Paced { acquire, .. } => Some(*acquire),
+            _ => None,
+        }
+    }
+
+    /// The binary semaphore `vkQueuePresentKHR` waits on, if this frame has one.
+    pub fn present_binary(&self) -> Option<vk::Semaphore> {
+        match self {
+            SubmitSync::Binary { signal, .. } | SubmitSync::SignalOnly { signal } => Some(*signal),
+            SubmitSync::Paced { signal, .. } => Some(*signal),
+            _ => None,
         }
     }
 
@@ -96,45 +132,77 @@ impl SubmitSync {
         }
     }
 
-    /// The `SemaphoreSubmitInfo` for the wait, if there is one.
+    /// The `SemaphoreSubmitInfo`s for the waits.
     ///
     /// A binary semaphore has no value, so `value` is left at zero, which the
     /// spec defines as "wait for the first signal".
-    pub fn wait_info(&self) -> Option<vk::SemaphoreSubmitInfo<'_>> {
-        let (semaphore, value) = match self {
-            SubmitSync::Binary { wait, .. } => (*wait, 0),
+    pub fn wait_infos(&self) -> Vec<vk::SemaphoreSubmitInfo<'_>> {
+        match self {
+            SubmitSync::Binary { wait, .. } => vec![info(*wait, 0, self.wait_stage())],
             SubmitSync::Timeline {
                 semaphore,
                 wait_value,
                 ..
-            } => (*semaphore, *wait_value),
-            _ => return None,
-        };
-        Some(vk::SemaphoreSubmitInfo {
-            semaphore,
-            value,
-            stage_mask: self.wait_stage(),
-            ..Default::default()
-        })
+            } => vec![info(*semaphore, *wait_value, self.wait_stage())],
+            // Two waits: the pacing value, then the image being ready. The
+            // stage masks differ, because the image is a colour attachment
+            // while the pacing wait is about the GPU having caught up at all.
+            SubmitSync::Paced {
+                timeline,
+                wait_value,
+                acquire,
+                ..
+            } => vec![
+                info(
+                    *timeline,
+                    *wait_value,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                ),
+                info(*acquire, 0, self.wait_stage()),
+            ],
+            SubmitSync::SignalOnly { .. } | SubmitSync::None => Vec::new(),
+        }
     }
 
-    /// The `SemaphoreSubmitInfo` for the signal, if there is one.
-    pub fn signal_info(&self) -> Option<vk::SemaphoreSubmitInfo<'_>> {
-        let (semaphore, value) = match self {
-            SubmitSync::Binary { signal, .. } | SubmitSync::SignalOnly { signal } => (*signal, 0),
+    /// The `SemaphoreSubmitInfo`s for the signals.
+    pub fn signal_infos(&self) -> Vec<vk::SemaphoreSubmitInfo<'_>> {
+        match self {
+            SubmitSync::Binary { signal, .. } | SubmitSync::SignalOnly { signal } => {
+                vec![info(*signal, 0, self.signal_stage())]
+            }
             SubmitSync::Timeline {
                 semaphore,
                 signal_value,
                 ..
-            } => (*semaphore, *signal_value),
-            SubmitSync::None => return None,
-        };
-        Some(vk::SemaphoreSubmitInfo {
-            semaphore,
-            value,
-            stage_mask: self.signal_stage(),
-            ..Default::default()
-        })
+            } => vec![info(*semaphore, *signal_value, self.signal_stage())],
+            // Two signals: the present semaphore, which is binary and carries no
+            // value, and the timeline value that lets the next frame know this
+            // one finished.
+            SubmitSync::Paced {
+                signal,
+                timeline,
+                signal_value,
+                ..
+            } => vec![
+                info(*signal, 0, self.signal_stage()),
+                info(*timeline, *signal_value, self.signal_stage()),
+            ],
+            SubmitSync::None => Vec::new(),
+        }
+    }
+}
+
+/// One `SemaphoreSubmitInfo`, in the shape every arm above needs it.
+fn info(
+    semaphore: vk::Semaphore,
+    value: TimelineValue,
+    stage: vk::PipelineStageFlags2,
+) -> vk::SemaphoreSubmitInfo<'static> {
+    vk::SemaphoreSubmitInfo {
+        semaphore,
+        value,
+        stage_mask: stage,
+        ..Default::default()
     }
 }
 
@@ -187,8 +255,8 @@ pub struct Submission<'a> {
 
 /// Build a `SubmitInfo2` and the arrays it references.
 pub fn build_submit_info(batch: &SubmitBatch) -> Submission<'_> {
-    let waits: Vec<_> = batch.sync.wait_info().into_iter().collect();
-    let signals: Vec<_> = batch.sync.signal_info().into_iter().collect();
+    let waits = batch.sync.wait_infos();
+    let signals = batch.sync.signal_infos();
     let buffers: Vec<_> = batch
         .command_buffers
         .iter()
@@ -279,17 +347,16 @@ mod tests {
     }
 
     #[test]
-    fn a_timeline_submission_signals_no_separate_semaphore() {
+    fn a_timeline_submission_signals_the_semaphore_it_waits_on() {
+        // One semaphore is both the wait and the signal, told apart by value:
+        // waiting on N and raising it to N+1 is the documented pattern.
         let s = SubmitSync::Timeline {
             semaphore: sem(9),
             wait_value: 1,
             signal_value: 2,
         };
-        assert_eq!(
-            s.signal_semaphore(),
-            None,
-            "one semaphore is both wait and signal"
-        );
+        assert_eq!(s.wait_semaphore(), Some(sem(9)));
+        assert_eq!(s.signal_semaphore(), Some(sem(9)));
     }
 
     #[test]
@@ -371,9 +438,10 @@ mod tests {
             wait: sem(1),
             signal: sem(2),
         };
-        let info = sync.wait_info().unwrap();
-        assert_eq!(info.semaphore, sem(1));
-        assert_eq!(info.value, 0, "a binary wait has no timeline value");
+        let infos = sync.wait_infos();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].semaphore, sem(1));
+        assert_eq!(infos[0].value, 0, "a binary wait has no timeline value");
     }
 
     #[test]
@@ -383,9 +451,9 @@ mod tests {
             wait_value: 7,
             signal_value: 8,
         };
-        let info = sync.wait_info().unwrap();
-        assert_eq!(info.semaphore, sem(9));
-        assert_eq!(info.value, 7);
+        let infos = sync.wait_infos();
+        assert_eq!(infos[0].semaphore, sem(9));
+        assert_eq!(infos[0].value, 7);
     }
 
     #[test]
@@ -395,14 +463,119 @@ mod tests {
             wait_value: 1,
             signal_value: 11,
         };
-        let info = sync.signal_info().unwrap();
-        assert_eq!(info.value, 11);
+        let infos = sync.signal_infos();
+        assert_eq!(infos[0].value, 11);
     }
 
     #[test]
     fn a_none_submission_has_no_infos() {
-        assert!(SubmitSync::None.wait_info().is_none());
-        assert!(SubmitSync::None.signal_info().is_none());
+        assert!(SubmitSync::None.wait_infos().is_empty());
+        assert!(SubmitSync::None.signal_infos().is_empty());
+    }
+
+    #[test]
+    fn a_paced_frame_waits_on_both_the_timeline_and_the_acquire() {
+        // The bug this fixes: the frame waited on a timeline value that only
+        // the timeline semaphore could raise, while acquire signalled a binary
+        // one nothing was waiting on. The fence then timed out rather than
+        // reporting anything.
+        let sync = SubmitSync::Paced {
+            timeline: sem(9),
+            wait_value: 3,
+            acquire: sem(4),
+            signal: sem(5),
+            signal_value: 4,
+        };
+        let waits = sync.wait_infos();
+        assert_eq!(waits.len(), 2, "a paced frame waits twice");
+        assert_eq!(waits[0].semaphore, sem(9));
+        assert_eq!(waits[0].value, 3);
+        assert_eq!(waits[1].semaphore, sem(4));
+        assert_eq!(waits[1].value, 0, "the acquire semaphore is binary");
+    }
+
+    #[test]
+    fn a_paced_frame_signals_the_present_semaphore_and_the_timeline() {
+        let sync = SubmitSync::Paced {
+            timeline: sem(9),
+            wait_value: 3,
+            acquire: sem(4),
+            signal: sem(5),
+            signal_value: 4,
+        };
+        let signals = sync.signal_infos();
+        assert_eq!(signals.len(), 2);
+        assert_eq!(signals[0].semaphore, sem(5), "present waits on this");
+        assert_eq!(signals[0].value, 0, "the present semaphore is binary");
+        assert_eq!(signals[1].semaphore, sem(9), "the pace advances here");
+        assert_eq!(signals[1].value, 4);
+    }
+
+    #[test]
+    fn a_paced_frame_never_reuses_a_binary_semaphore() {
+        // Reusing one *binary* semaphore as both wait and signal is invalid.
+        // A timeline semaphore is exempt: waiting on N and signalling N+1 is the
+        // documented pattern, and that is what the pacing wait does.
+        let sync = SubmitSync::Paced {
+            timeline: sem(9),
+            wait_value: 1,
+            acquire: sem(4),
+            signal: sem(5),
+            signal_value: 2,
+        };
+        // A valid Binary names two different semaphores, and the accessor
+        // pair reports them separately rather than collapsing to one.
+        let binary = SubmitSync::Binary {
+            wait: sem(4),
+            signal: sem(5),
+        };
+        assert_ne!(binary.acquire_binary(), binary.present_binary());
+        assert_eq!(binary.acquire_binary(), Some(sem(4)));
+        assert_eq!(binary.present_binary(), Some(sem(5)));
+
+        // A timeline-only frame has no binary semaphores at all, which is
+        // exactly why it cannot be used as a swapchain frame.
+        let timeline = SubmitSync::Timeline {
+            semaphore: sem(9),
+            wait_value: 1,
+            signal_value: 2,
+        };
+        assert_eq!(timeline.acquire_binary(), None);
+        assert_eq!(timeline.present_binary(), None);
+
+        // And the paced frame's two binary semaphores are distinct.
+        assert_ne!(sync.acquire_binary(), sync.present_binary());
+    }
+
+    #[test]
+    fn a_paced_frame_waits_and_signals() {
+        let sync = SubmitSync::Paced {
+            timeline: sem(9),
+            wait_value: 1,
+            acquire: sem(4),
+            signal: sem(5),
+            signal_value: 2,
+        };
+        assert!(sync.waits());
+        assert!(sync.signals());
+        assert_eq!(sync.wait_semaphore(), Some(sem(9)));
+        assert_eq!(sync.signal_semaphore(), Some(sem(5)));
+    }
+
+    #[test]
+    fn a_paced_submit_info_counts_two_waits_and_two_signals() {
+        let batch = batch_with(SubmitSync::Paced {
+            timeline: sem(9),
+            wait_value: 1,
+            acquire: sem(4),
+            signal: sem(5),
+            signal_value: 2,
+        });
+        let s = build_submit_info(&batch);
+        assert_eq!(s.info.wait_semaphore_info_count, 2);
+        assert_eq!(s.info.signal_semaphore_info_count, 2);
+        assert_eq!(s._waits[1].semaphore, sem(4));
+        assert_eq!(s._signals[0].semaphore, sem(5));
     }
 
     #[test]

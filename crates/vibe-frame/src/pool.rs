@@ -47,14 +47,15 @@ impl FrameConfig {
         self.frames_in_flight
     }
 
-    /// Number of binary semaphores: zero on the timeline path, which uses a
-    /// single semaphore for every frame.
-    pub fn binary_semaphores(&self) -> usize {
-        if self.use_timeline {
-            0
-        } else {
-            self.frames_in_flight
-        }
+    /// Number of WSI semaphores: two per frame on every tier.
+    ///
+    /// `vkAcquireNextImageKHR` and `vkQueuePresentKHR` both require binary
+    /// semaphores with no value field, so the timeline path cannot replace them.
+    /// Two per frame rather than one because a submit may not use the same
+    /// semaphore as both its wait and its signal: the frame waits on the one
+    /// acquire signalled and signals the one present waits on.
+    pub fn wsi_semaphores(&self) -> usize {
+        self.frames_in_flight * 2
     }
 
     /// Number of fences: one per frame on both paths, so a frame can wait on
@@ -231,8 +232,11 @@ impl CommandPool {
 pub struct FrameResources {
     /// One fence per frame slot.
     pub fences: Vec<vk::Fence>,
-    /// Per-frame binary semaphores; empty on the timeline path.
-    pub binary_semaphores: Vec<vk::Semaphore>,
+    /// Per-frame WSI semaphores, two per frame: acquire and present.
+    ///
+    /// Present on every tier, unlike the timeline semaphore, because
+    /// `vkAcquireNextImageKHR` and `vkQueuePresentKHR` only accept binary ones.
+    pub wsi_semaphores: Vec<vk::Semaphore>,
     /// The single timeline semaphore, when the tier supports one.
     pub timeline: Option<vk::Semaphore>,
     /// The value the last submitted frame will signal.
@@ -283,7 +287,7 @@ impl FrameResources {
                 }
             }
 
-            let mut binary_semaphores = Vec::with_capacity(config.binary_semaphores());
+            let mut wsi_semaphores = Vec::with_capacity(config.wsi_semaphores());
             let timeline = if config.use_timeline {
                 // A timeline semaphore is a binary semaphore with a pNext carrying
                 // the initial value; ash exposes one create call for both.
@@ -309,16 +313,18 @@ impl FrameResources {
                 None
             };
 
-            if !config.use_timeline {
+            // Binary semaphores are needed on every tier: the WSI calls take
+            // no value and have no timeline equivalent.
+            {
                 let info = vk::SemaphoreCreateInfo::default();
-                for _ in 0..config.binary_semaphores() {
+                for _ in 0..config.wsi_semaphores() {
                     match device.create_semaphore(&info, None) {
-                        Ok(s) => binary_semaphores.push(s),
+                        Ok(s) => wsi_semaphores.push(s),
                         Err(e) => {
                             for f in fences {
                                 device.destroy_fence(f, None);
                             }
-                            for s in binary_semaphores {
+                            for s in wsi_semaphores {
                                 device.destroy_semaphore(s, None);
                             }
                             return Err(FrameError::Vk(e));
@@ -329,7 +335,7 @@ impl FrameResources {
 
             Ok(FrameResources {
                 fences,
-                binary_semaphores,
+                wsi_semaphores,
                 timeline,
                 submitted_value: 0,
                 submitted: 0,
@@ -386,9 +392,14 @@ impl FrameResources {
         self.fences.get(slot).copied()
     }
 
-    /// The binary semaphore for a slot, on the binary path.
-    pub fn binary_semaphore(&self, slot: usize) -> Option<vk::Semaphore> {
-        self.binary_semaphores.get(slot).copied()
+    /// The semaphore `vkAcquireNextImageKHR` signals for a slot.
+    pub fn acquire_semaphore(&self, slot: usize) -> Option<vk::Semaphore> {
+        self.wsi_semaphores.get(slot * 2).copied()
+    }
+
+    /// The semaphore the frame signals for `vkQueuePresentKHR` to wait on.
+    pub fn present_semaphore(&self, slot: usize) -> Option<vk::Semaphore> {
+        self.wsi_semaphores.get(slot * 2 + 1).copied()
     }
 
     /// The timeline semaphore, on the timeline path.
@@ -421,7 +432,7 @@ impl FrameResources {
             for f in self.fences.drain(..) {
                 device.destroy_fence(f, None);
             }
-            for s in self.binary_semaphores.drain(..) {
+            for s in self.wsi_semaphores.drain(..) {
                 device.destroy_semaphore(s, None);
             }
             if let Some(t) = self.timeline.take() {
@@ -437,20 +448,23 @@ pub type SharedFrameResources = Arc<FrameResources>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ash::vk::Handle as _;
     use vibe_vk::SyncTier;
 
     #[test]
-    fn a_timeline_config_uses_one_semaphore() {
+    fn a_timeline_config_still_creates_wsi_semaphores() {
+        // The timeline semaphore cannot be passed to vkAcquireNextImageKHR,
+        // which requires a binary one, so every tier needs these.
         let c = FrameConfig::for_tier(SyncTier::Sync2Timeline);
         assert!(c.use_timeline);
-        assert_eq!(c.binary_semaphores(), 0);
+        assert_eq!(c.wsi_semaphores(), c.frames_in_flight * 2);
     }
 
     #[test]
-    fn a_binary_config_uses_one_per_frame() {
+    fn a_binary_config_uses_two_per_frame() {
         let c = FrameConfig::for_tier(SyncTier::Legacy);
         assert!(!c.use_timeline);
-        assert_eq!(c.binary_semaphores(), c.frames_in_flight);
+        assert_eq!(c.wsi_semaphores(), c.frames_in_flight * 2);
     }
 
     #[test]
@@ -479,8 +493,10 @@ mod tests {
     fn bookkeeping(config: FrameConfig) -> FrameResources {
         FrameResources {
             fences: vec![vk::Fence::null(); config.fences()],
-            binary_semaphores: (0..config.binary_semaphores())
-                .map(|_| vk::Semaphore::null())
+            wsi_semaphores: (0..config.wsi_semaphores())
+                // Distinct handles: a test that checks the pairs differ cannot
+                // tell null from null.
+                .map(|i| vk::Semaphore::from_raw(i as u64 + 1))
                 .collect(),
             timeline: config.use_timeline.then_some(vk::Semaphore::null()),
             submitted_value: 0,
@@ -568,7 +584,45 @@ mod tests {
     fn a_binary_config_has_no_timeline_semaphore() {
         let r = bookkeeping(FrameConfig::for_tier(SyncTier::Legacy));
         assert!(r.timeline_semaphore().is_none());
-        assert!(r.binary_semaphore(0).is_some());
+        assert!(r.acquire_semaphore(0).is_some());
+    }
+
+    #[test]
+    fn acquire_and_present_use_different_semaphores() {
+        // A submit may not wait on and signal the same semaphore.
+        let r = bookkeeping(FrameConfig::with_frames(SyncTier::Sync2Timeline, 2));
+        for slot in 0..2 {
+            assert_ne!(
+                r.acquire_semaphore(slot),
+                r.present_semaphore(slot),
+                "slot {slot}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_slot_has_its_own_pair() {
+        let r = bookkeeping(FrameConfig::with_frames(SyncTier::Sync2Timeline, 2));
+        let mut seen = std::collections::HashSet::new();
+        for slot in 0..2 {
+            seen.insert(r.acquire_semaphore(slot));
+            seen.insert(r.present_semaphore(slot));
+        }
+        assert_eq!(seen.len(), 4, "two frames need four distinct semaphores");
+    }
+
+    #[test]
+    fn a_slot_past_the_frame_count_has_no_pair() {
+        let r = bookkeeping(FrameConfig::with_frames(SyncTier::Sync2Timeline, 2));
+        assert!(r.acquire_semaphore(2).is_none());
+        assert!(r.present_semaphore(2).is_none());
+    }
+
+    #[test]
+    fn a_timeline_config_still_answers_the_wsi_calls() {
+        let r = bookkeeping(FrameConfig::for_tier(SyncTier::Sync2Timeline));
+        assert!(r.acquire_semaphore(0).is_some());
+        assert!(r.present_semaphore(0).is_some());
     }
 
     #[test]

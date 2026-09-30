@@ -204,7 +204,29 @@ impl Swapchain {
             vk::CompositeAlphaFlagsKHR::INHERIT
         };
 
-        let image_usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST;
+        // The readback path copies a presented image into a host buffer, which
+        // needs TRANSFER_SRC. Only request it when the surface supports it:
+        // asking for a usage the surface does not offer makes
+        // vkCreateSwapchainKHR fail, which is worse than not being able to
+        // read back.
+        let mut image_usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        if caps
+            .supported_usage_flags
+            .contains(vk::ImageUsageFlags::TRANSFER_DST)
+        {
+            image_usage |= vk::ImageUsageFlags::TRANSFER_DST;
+        }
+        if caps
+            .supported_usage_flags
+            .contains(vk::ImageUsageFlags::TRANSFER_SRC)
+        {
+            image_usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+        } else {
+            warn!(
+                "surface does not support TRANSFER_SRC; frames cannot be read back \
+                 for verification"
+            );
+        }
 
         let queue_families: [u32; 2] = [graphics_queue, present_queue];
         let unique_families = queue_families.len() == 2 && queue_families[0] != queue_families[1];

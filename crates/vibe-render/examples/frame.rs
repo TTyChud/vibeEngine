@@ -335,23 +335,17 @@ fn main() {
         }
     };
     {
+        let [into_dst, into_read] =
+            vibe_vk::upload_image_barriers(texture.image(), vk::ImageAspectFlags::COLOR);
         let mut enc = vibe_vk::BarrierEncoder::for_tier(logical.sync_tier());
-        enc.push(
-            vibe_vk::Barrier::image(texture.image(), vk::ImageAspectFlags::COLOR)
-                .src(vibe_vk::Stage::None, vibe_vk::Access::None)
-                .dst(vibe_vk::Stage::Transfer, vibe_vk::Access::TransferWrite),
-        );
+        enc.push(into_dst);
         unsafe { enc.record(device, &sync2, upload_cmd) };
         if let Err(e) = unsafe { texture.record_upload(device, upload_cmd, staging.buffer()) } {
             eprintln!("FAIL record upload: {e}");
             return;
         }
         let mut enc2 = vibe_vk::BarrierEncoder::for_tier(logical.sync_tier());
-        enc2.push(
-            vibe_vk::Barrier::image(texture.image(), vk::ImageAspectFlags::COLOR)
-                .src(vibe_vk::Stage::Transfer, vibe_vk::Access::TransferWrite)
-                .dst(vibe_vk::Stage::FragmentShader, vibe_vk::Access::ShaderRead),
-        );
+        enc2.push(into_read);
         unsafe { enc2.record(device, &sync2, upload_cmd) };
     }
     if let Err(e) = unsafe { upload_pool.end(device, 0) } {
@@ -421,19 +415,36 @@ fn main() {
         pipeline,
         vibe_render::RendererDesc::new(w, h, swapchain.format().format),
     );
+    // Four quadrants in four distinct colours, so the readback can check that
+    // each quad landed where the camera says it should. A single full-window
+    // quad cannot distinguish a correct draw from a wrong one, which is the
+    // whole reason this example reads pixels back at all.
+    let half_w = w as f32 / 2.0;
+    let half_h = h as f32 / 2.0;
+    let quadrants = [
+        (glam::Vec2::ZERO, [255, 0, 0, 255]), // top left, red
+        (
+            glam::Vec2::new(half_w, 0.0),
+            [0, 255, 0, 255], // top right, green
+        ),
+        (
+            glam::Vec2::new(0.0, half_h),
+            [0, 0, 255, 255], // bottom left, blue
+        ),
+        (
+            glam::Vec2::new(half_w, half_h),
+            [255, 255, 0, 255], // bottom right, yellow
+        ),
+    ];
     {
         let batcher = renderer.batcher_mut();
         let tex = SubTexture::full(0);
-        // A column of translucent quads in different hues, so the readback can
-        // tell each one apart, then one rotated, then one off-screen.
+        for (origin, color) in quadrants {
+            let _ = batcher.push_quad(origin, glam::Vec2::new(half_w, half_h), color, &tex);
+        }
+        // One off-screen quad, which must not appear anywhere in the frame.
         let _ = batcher.push_quad(
-            glam::Vec2::ZERO,
-            glam::Vec2::new(w as f32, h as f32),
-            [255, 0, 0, 255],
-            &tex,
-        );
-        let _ = batcher.push_quad(
-            glam::Vec2::new(-500.0, -500.0),
+            glam::Vec2::new(w as f32 + 500.0, -500.0),
             glam::Vec2::splat(50.0),
             [255, 255, 255, 255],
             &tex,
@@ -510,22 +521,27 @@ fn main() {
     );
 
     // 9. Acquire, record, submit, present
-    let signal = resources
-        .timeline_semaphore()
-        .or_else(|| resources.binary_semaphore(slot));
-    let Some(signal) = signal else {
-        eprintln!("FAIL no signal semaphore");
+    // `vkAcquireNextImageKHR` requires a binary semaphore, so the timeline one
+    // cannot be used here even on a timeline tier. The frame waits on this and
+    // signals a second one, because a submit may not use the same semaphore as
+    // both its wait and its signal.
+    let (Some(acquire_sem), Some(present_sem)) = (
+        resources.acquire_semaphore(slot),
+        resources.present_semaphore(slot),
+    ) else {
+        eprintln!("FAIL no WSI semaphores");
         return;
     };
 
-    let acquired =
-        match unsafe { swapchain.acquire(&swapchain_loader, TIMEOUT, signal, vk::Fence::null()) } {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("FAIL acquire: {e}");
-                return;
-            }
-        };
+    let acquired = match unsafe {
+        swapchain.acquire(&swapchain_loader, TIMEOUT, acquire_sem, vk::Fence::null())
+    } {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("FAIL acquire: {e}");
+            return;
+        }
+    };
     let index = match acquired {
         vibe_vk::AcquireResult::Ready { index } => index,
         other => {
@@ -550,17 +566,8 @@ fn main() {
     // a colour attachment. The transition back to present has to be recorded
     // after the render pass, not before it.
     let mut encoder = vibe_vk::BarrierEncoder::for_tier(logical.sync_tier());
-    encoder.push(
-        vibe_vk::Barrier::image(target_image, vk::ImageAspectFlags::COLOR)
-            .src(vibe_vk::Stage::None, vibe_vk::Access::None)
-            .dst(
-                vibe_vk::Stage::ColorAttachmentOutput,
-                vibe_vk::Access::ColorAttachmentWrite,
-            ),
-    );
-    eprintln!("  barrier: calling record");
+    encoder.push(vibe_render::QuadRenderer::acquire_barrier(target_image));
     unsafe { encoder.record(device, &sync2, cmd) };
-    eprintln!("  barrier: returned");
     println!("[10] recorded {} pre-pass barrier(s)", encoder.len());
 
     let vertex_handle = vertex_buffer.buffer();
@@ -590,6 +597,10 @@ fn main() {
     let mut present_encoder = vibe_vk::BarrierEncoder::for_tier(logical.sync_tier());
     present_encoder.push(
         vibe_vk::Barrier::image(target_image, vk::ImageAspectFlags::COLOR)
+            .layouts(
+                ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                ash::vk::ImageLayout::PRESENT_SRC_KHR,
+            )
             .src(
                 vibe_vk::Stage::ColorAttachmentOutput,
                 vibe_vk::Access::ColorAttachmentWrite,
@@ -606,22 +617,25 @@ fn main() {
         return;
     }
 
-    // `vkAcquireNextImageKHR` signalled `signal`, meaning "this image is ready to
-    // render into", so the frame must wait on it before drawing. Waiting on and
-    // signalling the same binary semaphore is legal for a single frame, and the
-    // timeline path handles the steady state by waiting on the previous frame's
-    // value and signalling the next.
+    // Two independent waits. `vkAcquireNextImageKHR` signalled `acquire_sem`,
+    // meaning "this image is ready to render into", so the frame waits on it
+    // before drawing. Separately the timeline wait keeps the CPU from getting
+    // more than frames_in_flight ahead of the GPU.
     let sync = match resources.timeline_semaphore() {
-        // The acquire signalled this frame's own value, so the frame waits for
-        // that value: that is the "image is ready to render into" signal.
-        Some(sem) => vibe_frame::SubmitSync::Timeline {
-            semaphore: sem,
-            wait_value: value,
-            signal_value: value + 1,
+        Some(timeline) => vibe_frame::SubmitSync::Paced {
+            timeline,
+            // The previous frame's value: this frame is not allowed to start
+            // until the one before it has finished.
+            wait_value: value - 1,
+            acquire: acquire_sem,
+            signal: present_sem,
+            signal_value: value,
         },
+        // Without a timeline semaphore there is no pacing wait, so the frame
+        // waits only on the acquire semaphore and signals the present one.
         None => vibe_frame::SubmitSync::Binary {
-            wait: signal,
-            signal,
+            wait: acquire_sem,
+            signal: present_sem,
         },
     };
     // Two command buffers: the frame itself, and the present transition, which
@@ -651,23 +665,22 @@ fn main() {
     }
     // A successful present only proves the driver accepted the work. Reading the
     // image back proves pixels were actually written.
-    let (lit, total) = read_back(
-        device,
-        &sync2,
-        &logical,
-        graphics_queue,
-        target_image,
-        w,
-        h,
-        [0.02, 0.02, 0.03],
+    let Some(verdict) = read_back(device, &sync2, &logical, graphics_queue, target_image, w, h)
+    else {
+        eprintln!("FAIL readback");
+        return;
+    };
+    println!(
+        "READBACK: {} of {} sampled pixels are the colour the batch asked for",
+        verdict.matched,
+        verdict.samples.len()
     );
-    println!("READBACK: {lit} of {total} pixels are not the clear colour");
-    if total > 0 && lit == 0 {
-        eprintln!("WARNING: only one colour in the frame, nothing was drawn");
+    if verdict.matched != verdict.samples.len() {
+        eprintln!("MISMATCH: the draw did not land where the camera put it");
     }
 
     let presented =
-        match unsafe { swapchain.present(&swapchain_loader, graphics_queue, index, signal) } {
+        match unsafe { swapchain.present(&swapchain_loader, graphics_queue, index, present_sem) } {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("FAIL present: {e}");
@@ -745,9 +758,22 @@ fn renderer_camera_matrix(width: f32, height: f32) -> glam::Mat4 {
     vibe_math::orthographic_rh(0.0, width, 0.0, height, -1.0, 1.0)
 }
 
-/// Copy the presented image into a host buffer and count the pixels that are not
-/// the clear colour, which is what proves the draw landed rather than merely
-/// being accepted.
+/// What a readback found in the frame.
+#[derive(Debug, Clone)]
+struct Verdict {
+    /// The colour found at each sample point, as BGR.
+    samples: Vec<[u8; 3]>,
+    /// The label each sample was expected to be.
+    expected: Vec<&'static str>,
+    /// How many samples matched their expected colour.
+    matched: usize,
+}
+
+/// Copy the rendered image into a host buffer and describe what is in it.
+///
+/// Counting distinct colours is the honest check. Comparing against the clear
+/// colour is not: a quad that covers the whole window legitimately leaves no
+/// clear pixels, so that metric reports a correct frame as a blank one.
 #[allow(clippy::too_many_arguments)]
 fn read_back(
     device: &ash::Device,
@@ -757,8 +783,7 @@ fn read_back(
     image: ash::vk::Image,
     width: u32,
     height: u32,
-    clear: [f32; 3],
-) -> (usize, usize) {
+) -> Option<Verdict> {
     use vibe_vk::memory::{BufferUsage, GpuBuffer, MemoryNeed};
 
     let stride = width as u64 * 4;
@@ -777,19 +802,19 @@ fn read_back(
         )
     } {
         Ok(b) => b,
-        Err(_) => return (0, 0),
+        Err(_) => return None,
     };
     if unsafe { buffer.map(device) }.is_err() {
-        return (0, 0);
+        return None;
     }
 
     let Ok(pool) = (unsafe {
         vibe_frame::CommandPool::new(device, logical.graphics_family().unwrap_or(0), 1)
     }) else {
-        return (0, 0);
+        return None;
     };
     let Ok(cmd) = (unsafe { pool.begin(device, 0) }) else {
-        return (0, 0);
+        return None;
     };
 
     {
@@ -797,7 +822,14 @@ fn read_back(
         let mut enc = vibe_vk::BarrierEncoder::for_tier(logical.sync_tier());
         enc.push(
             vibe_vk::Barrier::image(image, ash::vk::ImageAspectFlags::COLOR)
-                .src(vibe_vk::Stage::None, vibe_vk::Access::None)
+                .layouts(
+                    ash::vk::ImageLayout::PRESENT_SRC_KHR,
+                    ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                )
+                .src(
+                    vibe_vk::Stage::ColorAttachmentOutput,
+                    vibe_vk::Access::ColorAttachmentWrite,
+                )
                 .dst(vibe_vk::Stage::Transfer, vibe_vk::Access::TransferRead),
         );
         unsafe { enc.record(device, sync2, cmd) };
@@ -836,33 +868,43 @@ fn read_back(
                 .src(vibe_vk::Stage::Transfer, vibe_vk::Access::TransferWrite)
                 .dst(vibe_vk::Stage::Host, vibe_vk::Access::HostRead),
         );
+        // The copy left the image in TRANSFER_SRC_OPTIMAL, and present requires
+        // PRESENT_SRC_KHR. Reading a frame must not break the frame after it.
+        enc2.push(
+            vibe_vk::Barrier::image(image, ash::vk::ImageAspectFlags::COLOR)
+                .layouts(
+                    ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    ash::vk::ImageLayout::PRESENT_SRC_KHR,
+                )
+                .src(vibe_vk::Stage::Transfer, vibe_vk::Access::TransferRead)
+                .dst(vibe_vk::Stage::BottomOfPipe, vibe_vk::Access::None),
+        );
         unsafe { enc2.record(device, sync2, cmd) };
     }
 
     if unsafe { pool.end(device, 0) }.is_err() {
-        return (0, 0);
+        return None;
     }
     let batch = vibe_frame::SubmitBatch::single(cmd, vibe_frame::SubmitSync::None);
     let sub = vibe_frame::build_submit_info(&batch);
     let Ok(fence) = (unsafe { device.create_fence(&ash::vk::FenceCreateInfo::default(), None) })
     else {
-        return (0, 0);
+        return None;
     };
     if unsafe { sync2.queue_submit2(queue, &[sub.info], fence) }.is_err() {
-        return (0, 0);
+        return None;
     }
     if unsafe { device.wait_for_fences(&[fence], true, 10_000_000_000) }.is_err() {
-        return (0, 0);
+        return None;
     }
     unsafe { device.destroy_fence(fence, None) };
 
     let Ok(data) = (unsafe { buffer.read_mapped(0, size as usize) }) else {
-        return (0, 0);
+        return None;
     };
 
-    // The surface is B8G8R8A8_SRGB, so blue is the first byte. A tolerance is
-    // needed because the clear goes through an sRGB surface.
-    // Write a PPM so the rendered image can actually be looked at.
+    // The surface is B8G8R8A8_SRGB, so blue is the first byte. Write a PPM so the
+    // rendered image can actually be looked at rather than inferred.
     {
         let path = std::path::Path::new("/tmp/vibe-frame.ppm");
         let mut ppm = format!("P6\n{} {}\n255\n", width, height).into_bytes();
@@ -874,9 +916,10 @@ fn read_back(
         println!("  wrote {}", path.display());
     }
 
-    // A quad can cover pixel 0, so it is not necessarily the background. Use a
-    // histogram: a frame with a clear and several quads must contain more than
-    // one colour, and the most common one is the background.
+    // A quad can cover pixel 0, so the frame's first colour is not necessarily
+    // the background. A histogram answers the question that matters without
+    // assuming anything about which colour is which: a frame with a clear and
+    // several quads must contain more than one.
     let mut histogram: std::collections::HashMap<[u8; 3], usize> = std::collections::HashMap::new();
     for p in data.chunks_exact(4) {
         *histogram.entry([p[2], p[1], p[0]]).or_default() += 1;
@@ -886,8 +929,47 @@ fn read_back(
     for (rgb, count) in ranked.iter().take(8) {
         println!("    rgb {rgb:?} x{count}");
     }
-    let total = width as usize * height as usize;
-    let dominant = ranked.first().map(|(_, c)| *c).unwrap_or(total);
-    let _ = clear;
-    (total.saturating_sub(dominant), total)
+
+    // Sample the middle of each quadrant and compare it with what the camera
+    // and the batch said should be there. This is the check that actually
+    // proves the draw: a flat frame of the right colour proves nothing.
+    let px = |x: u32, y: u32| -> [u8; 3] {
+        let i = (y as usize * width as usize + x as usize) * 4;
+        let p = &data[i..i + 4];
+        // The surface is B8G8R8A8, so the stored order is B, G, R.
+        [p[2], p[1], p[0]]
+    };
+    let quarter_w = width / 4;
+    let quarter_h = height / 4;
+    let points = [
+        (quarter_w, quarter_h, "top left red"),
+        (width - quarter_w, quarter_h, "top right green"),
+        (quarter_w, height - quarter_h, "bottom left blue"),
+        (width - quarter_w, height - quarter_h, "bottom right yellow"),
+    ];
+    // The surface is sRGB, so a linear 1.0 comes back as 255 and 0 as 0; the
+    // primaries survive that round trip, so an exact compare is safe here.
+    let wanted: [[u8; 3]; 4] = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
+    let mut samples = Vec::with_capacity(points.len());
+    let mut expected = Vec::with_capacity(points.len());
+    let mut matched = 0;
+    for (i, (x, y, label)) in points.iter().enumerate() {
+        let got = px(*x, *y);
+        let want = wanted[i];
+        let ok = got == want;
+        if ok {
+            matched += 1;
+        }
+        println!(
+            "    {label}: rgb {got:?} expected {want:?} {}",
+            if ok { "ok" } else { "MISMATCH" }
+        );
+        samples.push(got);
+        expected.push(*label);
+    }
+    Some(Verdict {
+        samples,
+        expected,
+        matched,
+    })
 }

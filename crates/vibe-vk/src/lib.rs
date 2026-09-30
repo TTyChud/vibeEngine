@@ -16,6 +16,7 @@ pub mod validation;
 
 pub use barrier::{
     Access, Barrier, BarrierEncoder, ResourceKind, Stage, image_to_shader_read, upload_barriers,
+    upload_image_barriers,
 };
 pub use context::{
     Entry, PhysicalDeviceChoice, PhysicalDeviceInfo, QueueRequirements, VkError, create_instance,

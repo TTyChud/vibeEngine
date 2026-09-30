@@ -47,7 +47,10 @@ fn vs_main(vertex: QuadVertex) -> VertexOut {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(0.0, 1.0, 0.0, 1.0);
+    // The tint arrives already normalised: the vertex attribute is UNORM8x4,
+    // so the hardware scales the four bytes into 0..1 on fetch.
+    let texel = textureSample(textures, tex_sampler, in.uv);
+    return in.color * texel;
 }
 "#;
 

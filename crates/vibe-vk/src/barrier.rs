@@ -185,6 +185,19 @@ pub struct Barrier {
     pub layer_count: u32,
     /// Aspect to transition, for depth/stencil images.
     pub aspect: vk::ImageAspectFlags,
+    /// Layout the image is in before this barrier.
+    ///
+    /// `UNDEFINED` discards the contents, which is correct for an image that is
+    /// about to be written and never read back.
+    pub old_layout: vk::ImageLayout,
+    /// Layout the image is in after this barrier.
+    ///
+    /// This has to name the layout the consuming command expects. A sampling
+    /// descriptor promises `SHADER_READ_ONLY_OPTIMAL`, a colour attachment
+    /// promises `COLOR_ATTACHMENT_OPTIMAL`, and present requires
+    /// `PRESENT_SRC_KHR`; anything else is a validation error, and on some
+    /// drivers a lost device rather than a reported one.
+    pub new_layout: vk::ImageLayout,
     /// Stage the producing work runs in.
     pub src_stage: Stage,
     /// Access the producing work performs.
@@ -214,6 +227,9 @@ impl Barrier {
             base_layer: 0,
             layer_count: vk::REMAINING_ARRAY_LAYERS,
             aspect: vk::ImageAspectFlags::empty(),
+            // A memory barrier names no image, so the layouts do not apply.
+            old_layout: vk::ImageLayout::UNDEFINED,
+            new_layout: vk::ImageLayout::UNDEFINED,
             src_stage,
             src_access,
             dst_stage,
@@ -234,6 +250,8 @@ impl Barrier {
             base_layer: 0,
             layer_count: vk::REMAINING_ARRAY_LAYERS,
             aspect: vk::ImageAspectFlags::empty(),
+            old_layout: vk::ImageLayout::UNDEFINED,
+            new_layout: vk::ImageLayout::UNDEFINED,
             src_stage: Stage::None,
             src_access: Access::None,
             dst_stage: Stage::None,
@@ -254,6 +272,11 @@ impl Barrier {
             base_layer: 0,
             layer_count: 1,
             aspect,
+            // Neither side is chosen yet: `.layouts()` has to say what the
+            // barrier actually transitions between, and guessing a default
+            // here is what made every transition in the engine land in GENERAL.
+            old_layout: vk::ImageLayout::UNDEFINED,
+            new_layout: vk::ImageLayout::UNDEFINED,
             src_stage: Stage::None,
             src_access: Access::None,
             dst_stage: Stage::None,
@@ -294,12 +317,35 @@ impl Barrier {
         self
     }
 
+    /// Set the layouts the image transitions between.
+    ///
+    /// Required on an image barrier: the consuming command's expected layout
+    /// has to be named, and both sides have to be stated rather than inferred.
+    pub fn layouts(mut self, old: vk::ImageLayout, new: vk::ImageLayout) -> Barrier {
+        self.old_layout = old;
+        self.new_layout = new;
+        self
+    }
+
     /// True when the barrier changes nothing, so it can be dropped.
+    ///
+    /// A layout transition counts as work even with no stages or access: moving
+    /// an image to the layout the next command needs is the whole point of some
+    /// barriers. A barrier whose layouts are both `UNDEFINED` and which names no
+    /// image cannot be a layout transition.
     pub fn is_noop(&self) -> bool {
-        self.src_stage == Stage::None
+        let no_sync = self.src_stage == Stage::None
             && self.src_access == Access::None
             && self.dst_stage == Stage::None
-            && self.dst_access == Access::None
+            && self.dst_access == Access::None;
+        let no_transition = self.old_layout == vk::ImageLayout::UNDEFINED
+            && self.new_layout == vk::ImageLayout::UNDEFINED;
+        no_sync && no_transition
+    }
+
+    /// True when this barrier transitions an image's layout.
+    pub fn transitions_layout(&self) -> bool {
+        self.kind == ResourceKind::Image && self.old_layout != self.new_layout
     }
 
     fn to_memory_barrier(&self) -> vk::MemoryBarrier<'_> {
@@ -327,8 +373,8 @@ impl Barrier {
         vk::ImageMemoryBarrier {
             src_access_mask: self.src_access.legacy_flags(),
             dst_access_mask: self.dst_access.legacy_flags(),
-            old_layout: vk::ImageLayout::UNDEFINED,
-            new_layout: vk::ImageLayout::GENERAL,
+            old_layout: self.old_layout,
+            new_layout: self.new_layout,
             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             image: self.handle,
@@ -374,8 +420,8 @@ impl Barrier {
             src_access_mask: self.src_access.flags2(),
             dst_stage_mask: self.dst_stage.flags(),
             dst_access_mask: self.dst_access.flags2(),
-            old_layout: vk::ImageLayout::UNDEFINED,
-            new_layout: vk::ImageLayout::GENERAL,
+            old_layout: self.old_layout,
+            new_layout: self.new_layout,
             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             image: self.handle,
@@ -593,10 +639,38 @@ pub fn upload_barriers() -> [Barrier; 1] {
 }
 
 /// The barrier that makes a written image readable by a fragment shader.
+///
+/// Ends in `SHADER_READ_ONLY_OPTIMAL` because that is the layout a sampling
+/// descriptor promises; a descriptor pointing at any other layout is invalid.
 pub fn image_to_shader_read(image: vk::Image, aspect: vk::ImageAspectFlags) -> Barrier {
     Barrier::image(image, aspect)
+        .layouts(
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        )
         .src(Stage::ColorAttachmentOutput, Access::ColorAttachmentWrite)
         .dst(Stage::FragmentShader, Access::ShaderRead)
+}
+
+/// The two barriers a texture upload needs: into `TRANSFER_DST_OPTIMAL` to
+/// receive the copy, then into `SHADER_READ_ONLY_OPTIMAL` to be sampled.
+pub fn upload_image_barriers(image: vk::Image, aspect: vk::ImageAspectFlags) -> [Barrier; 2] {
+    [
+        Barrier::image(image, aspect)
+            .layouts(
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            )
+            .src(Stage::None, Access::None)
+            .dst(Stage::Transfer, Access::TransferWrite),
+        Barrier::image(image, aspect)
+            .layouts(
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            )
+            .src(Stage::Transfer, Access::TransferWrite)
+            .dst(Stage::FragmentShader, Access::ShaderRead),
+    ]
 }
 
 #[cfg(test)]
@@ -829,6 +903,75 @@ mod tests {
         assert_eq!(b.layer_count, 1);
         assert_eq!(b.aspect, vk::ImageAspectFlags::DEPTH);
         assert!(b.is_noop(), "a fresh image barrier has no transitions yet");
+    }
+
+    #[test]
+    fn layouts_survive_into_both_conversions() {
+        // The bug this fixes: both conversions used to hardcode UNDEFINED to
+        // GENERAL, so every transition in the engine landed in GENERAL no
+        // matter what the caller asked for.
+        let b = Barrier::image(dummy_image(), vk::ImageAspectFlags::COLOR).layouts(
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        let legacy = b.to_image_barrier();
+        assert_eq!(legacy.old_layout, vk::ImageLayout::UNDEFINED);
+        assert_eq!(legacy.new_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+
+        let sync2 = b.to_image_sync2();
+        assert_eq!(sync2.old_layout, vk::ImageLayout::UNDEFINED);
+        assert_eq!(sync2.new_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+    }
+
+    #[test]
+    fn a_layout_only_barrier_is_not_a_noop() {
+        // No stages and no access, but the image still has to move: dropping
+        // this would leave the next command reading the wrong layout.
+        let b = Barrier::image(dummy_image(), vk::ImageAspectFlags::COLOR)
+            .layouts(vk::ImageLayout::UNDEFINED, vk::ImageLayout::PRESENT_SRC_KHR);
+        assert!(!b.is_noop());
+        assert!(b.transitions_layout());
+    }
+
+    #[test]
+    fn a_barrier_to_the_same_layout_transitions_nothing() {
+        let b = Barrier::image(dummy_image(), vk::ImageAspectFlags::COLOR)
+            .layouts(
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            )
+            .src(Stage::FragmentShader, Access::ShaderRead)
+            .dst(Stage::FragmentShader, Access::ShaderRead);
+        assert!(!b.transitions_layout());
+    }
+
+    #[test]
+    fn a_memory_barrier_carries_no_layout_transition() {
+        let b = Barrier::memory(
+            Stage::Transfer,
+            Access::TransferWrite,
+            Stage::FragmentShader,
+            Access::ShaderRead,
+        );
+        assert!(!b.transitions_layout(), "no image is named");
+    }
+
+    #[test]
+    fn upload_image_barriers_cover_both_sides_of_the_copy() {
+        let [into, out] = upload_image_barriers(dummy_image(), vk::ImageAspectFlags::COLOR);
+        assert_eq!(into.new_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        assert_eq!(out.old_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        assert_eq!(
+            out.new_layout,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            "a sampling descriptor promises this layout"
+        );
+    }
+
+    #[test]
+    fn image_to_shader_read_ends_in_the_sampling_layout() {
+        let b = image_to_shader_read(dummy_image(), vk::ImageAspectFlags::COLOR);
+        assert_eq!(b.new_layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     }
 
     #[test]

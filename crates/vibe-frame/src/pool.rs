@@ -47,15 +47,21 @@ impl FrameConfig {
         self.frames_in_flight
     }
 
-    /// Number of WSI semaphores: two per frame on every tier.
+    /// Number of acquire semaphores: one per frame.
     ///
-    /// `vkAcquireNextImageKHR` and `vkQueuePresentKHR` both require binary
-    /// semaphores with no value field, so the timeline path cannot replace them.
-    /// Two per frame rather than one because a submit may not use the same
-    /// semaphore as both its wait and its signal: the frame waits on the one
-    /// acquire signalled and signals the one present waits on.
-    pub fn wsi_semaphores(&self) -> usize {
-        self.frames_in_flight * 2
+    /// `vkAcquireNextImageKHR` requires a binary semaphore with no value field,
+    /// so the timeline path cannot replace it.
+    pub fn acquire_semaphores(&self) -> usize {
+        self.frames_in_flight
+    }
+
+    /// Number of present semaphores: one per swapchain image.
+    ///
+    /// Per image rather than per frame, because the presentation engine may
+    /// still hold a present semaphore after the present call. Zero images still
+    /// gets one, so an index is never out of range.
+    pub fn present_semaphores(&self, image_count: usize) -> usize {
+        image_count.max(1)
     }
 
     /// Number of fences: one per frame on both paths, so a frame can wait on
@@ -232,11 +238,20 @@ impl CommandPool {
 pub struct FrameResources {
     /// One fence per frame slot.
     pub fences: Vec<vk::Fence>,
-    /// Per-frame WSI semaphores, two per frame: acquire and present.
+    /// The acquire semaphores, one per frame.
     ///
     /// Present on every tier, unlike the timeline semaphore, because
-    /// `vkAcquireNextImageKHR` and `vkQueuePresentKHR` only accept binary ones.
-    pub wsi_semaphores: Vec<vk::Semaphore>,
+    /// `vkAcquireNextImageKHR` only accepts a binary one.
+    pub acquire_semaphores: Vec<vk::Semaphore>,
+    /// The semaphores a present waits on, one per swapchain image.
+    ///
+    /// Indexed by the *image*, not the frame, and that is the point: the
+    /// presentation engine holds a present semaphore past the
+    /// `vkQueuePresentKHR` call and only releases it when that image is
+    /// re-acquired, so a semaphore recycled per frame gets signalled again
+    /// while the previous present may still hold it. One per image cannot be in
+    /// two presents at once, because an image cannot be presented twice.
+    pub present_semaphores: Vec<vk::Semaphore>,
     /// The single timeline semaphore, when the tier supports one.
     pub timeline: Option<vk::Semaphore>,
     /// The value the last submitted frame will signal.
@@ -287,7 +302,6 @@ impl FrameResources {
                 }
             }
 
-            let mut wsi_semaphores = Vec::with_capacity(config.wsi_semaphores());
             let timeline = if config.use_timeline {
                 // A timeline semaphore is a binary semaphore with a pNext carrying
                 // the initial value; ash exposes one create call for both.
@@ -314,28 +328,42 @@ impl FrameResources {
             };
 
             // Binary semaphores are needed on every tier: the WSI calls take
-            // no value and have no timeline equivalent.
+            // no value and have no timeline equivalent. One per frame to acquire
+            // with, and one per swapchain image to present with.
+            let mut acquire_semaphores = Vec::with_capacity(config.acquire_semaphores());
+            let mut present_semaphores = Vec::with_capacity(config.present_semaphores(1));
             {
                 let info = vk::SemaphoreCreateInfo::default();
-                for _ in 0..config.wsi_semaphores() {
-                    match device.create_semaphore(&info, None) {
-                        Ok(s) => wsi_semaphores.push(s),
-                        Err(e) => {
-                            for f in fences {
-                                device.destroy_fence(f, None);
-                            }
-                            for s in wsi_semaphores {
-                                device.destroy_semaphore(s, None);
-                            }
-                            return Err(FrameError::Vk(e));
+                let make =
+                    |count: usize, into: &mut Vec<vk::Semaphore>| -> Result<(), vk::Result> {
+                        for _ in 0..count {
+                            into.push(device.create_semaphore(&info, None)?);
                         }
+                        Ok(())
+                    };
+                let made = make(config.acquire_semaphores(), &mut acquire_semaphores)
+                    .and_then(|()| make(config.present_semaphores(1), &mut present_semaphores));
+                if let Err(e) = made {
+                    for f in fences {
+                        device.destroy_fence(f, None);
                     }
+                    for s in acquire_semaphores
+                        .drain(..)
+                        .chain(present_semaphores.drain(..))
+                    {
+                        device.destroy_semaphore(s, None);
+                    }
+                    if let Some(t) = timeline {
+                        device.destroy_semaphore(t, None);
+                    }
+                    return Err(FrameError::Vk(e));
                 }
             }
 
             Ok(FrameResources {
                 fences,
-                wsi_semaphores,
+                acquire_semaphores,
+                present_semaphores,
                 timeline,
                 submitted_value: 0,
                 submitted: 0,
@@ -394,12 +422,39 @@ impl FrameResources {
 
     /// The semaphore `vkAcquireNextImageKHR` signals for a slot.
     pub fn acquire_semaphore(&self, slot: usize) -> Option<vk::Semaphore> {
-        self.wsi_semaphores.get(slot * 2).copied()
+        self.acquire_semaphores.get(slot).copied()
     }
 
-    /// The semaphore the frame signals for `vkQueuePresentKHR` to wait on.
-    pub fn present_semaphore(&self, slot: usize) -> Option<vk::Semaphore> {
-        self.wsi_semaphores.get(slot * 2 + 1).copied()
+    /// The semaphore a present of swapchain image `image` waits on.
+    ///
+    /// Keyed by the image, not the frame: the presentation engine may still
+    /// hold a present semaphore after the present call, and only reusing the one
+    /// belonging to the image it holds is safe.
+    pub fn present_semaphore(&self, image: usize) -> Option<vk::Semaphore> {
+        self.present_semaphores.get(image).copied()
+    }
+
+    /// Grow or shrink the present semaphores to cover `image_count` images.
+    ///
+    /// A swapchain rebuilt at a new size can have a different number of images,
+    /// and a set sized for the old one would either index out of range or leave
+    /// two images sharing a semaphore — which is the reuse the per-image scheme
+    /// exists to prevent.
+    ///
+    /// # Safety
+    ///
+    /// `device` must be live and no present may be in flight.
+    pub unsafe fn resize_present_semaphores(&mut self, device: &ash::Device, image_count: usize) {
+        let want = self.config.present_semaphores(image_count);
+        self.present_semaphores
+            .truncate(want.min(self.present_semaphores.len()));
+        let info = vk::SemaphoreCreateInfo::default();
+        while self.present_semaphores.len() < want {
+            match unsafe { device.create_semaphore(&info, None) } {
+                Ok(s) => self.present_semaphores.push(s),
+                Err(_) => break,
+            }
+        }
     }
 
     /// The timeline semaphore, on the timeline path.
@@ -432,7 +487,11 @@ impl FrameResources {
             for f in self.fences.drain(..) {
                 device.destroy_fence(f, None);
             }
-            for s in self.wsi_semaphores.drain(..) {
+            for s in self
+                .acquire_semaphores
+                .drain(..)
+                .chain(self.present_semaphores.drain(..))
+            {
                 device.destroy_semaphore(s, None);
             }
             if let Some(t) = self.timeline.take() {
@@ -457,14 +516,30 @@ mod tests {
         // which requires a binary one, so every tier needs these.
         let c = FrameConfig::for_tier(SyncTier::Sync2Timeline);
         assert!(c.use_timeline);
-        assert_eq!(c.wsi_semaphores(), c.frames_in_flight * 2);
+        assert_eq!(c.acquire_semaphores(), c.frames_in_flight);
+        assert_eq!(c.present_semaphores(4), 4);
     }
 
     #[test]
-    fn a_binary_config_uses_two_per_frame() {
+    fn a_binary_config_also_needs_wsi_semaphores() {
         let c = FrameConfig::for_tier(SyncTier::Legacy);
         assert!(!c.use_timeline);
-        assert_eq!(c.wsi_semaphores(), c.frames_in_flight * 2);
+        assert_eq!(c.acquire_semaphores(), c.frames_in_flight);
+    }
+
+    #[test]
+    fn present_semaphores_are_counted_per_swapchain_image() {
+        // Per image, not per frame: a per-frame semaphore is signalled again
+        // while the presentation engine may still hold it.
+        let c = FrameConfig::for_tier(SyncTier::Sync2Timeline);
+        assert_eq!(c.present_semaphores(1), 1);
+        assert_eq!(c.present_semaphores(6), 6);
+    }
+
+    #[test]
+    fn a_swapchain_with_no_images_still_gets_one_present_semaphore() {
+        let c = FrameConfig::for_tier(SyncTier::Sync2Timeline);
+        assert_eq!(c.present_semaphores(0), 1, "zero would index nothing");
     }
 
     #[test]
@@ -493,10 +568,13 @@ mod tests {
     fn bookkeeping(config: FrameConfig) -> FrameResources {
         FrameResources {
             fences: vec![vk::Fence::null(); config.fences()],
-            wsi_semaphores: (0..config.wsi_semaphores())
-                // Distinct handles: a test that checks the pairs differ cannot
-                // tell null from null.
+            acquire_semaphores: (0..config.acquire_semaphores())
+                // Distinct handles: a test that checks two differ cannot tell
+                // null from null.
                 .map(|i| vk::Semaphore::from_raw(i as u64 + 1))
+                .collect(),
+            present_semaphores: (0..4)
+                .map(|i| vk::Semaphore::from_raw(i as u64 + 100))
                 .collect(),
             timeline: config.use_timeline.then_some(vk::Semaphore::null()),
             submitted_value: 0,
@@ -608,14 +686,38 @@ mod tests {
             seen.insert(r.acquire_semaphore(slot));
             seen.insert(r.present_semaphore(slot));
         }
-        assert_eq!(seen.len(), 4, "two frames need four distinct semaphores");
+        assert_eq!(
+            seen.len(),
+            4,
+            "two frames need four distinct acquire semaphores"
+        );
     }
 
     #[test]
-    fn a_slot_past_the_frame_count_has_no_pair() {
+    fn a_slot_past_the_frame_count_has_no_acquire_semaphore() {
         let r = bookkeeping(FrameConfig::with_frames(SyncTier::Sync2Timeline, 2));
         assert!(r.acquire_semaphore(2).is_none());
-        assert!(r.present_semaphore(2).is_none());
+    }
+
+    #[test]
+    fn an_image_past_the_swapchain_has_no_present_semaphore() {
+        // Present semaphores are per image, so the bound is the image count
+        // rather than the frame count.
+        let r = bookkeeping(FrameConfig::with_frames(SyncTier::Sync2Timeline, 2));
+        assert!(r.present_semaphore(3).is_some());
+        assert!(r.present_semaphore(99).is_none());
+    }
+
+    #[test]
+    fn every_swapchain_image_has_its_own_present_semaphore() {
+        let r = bookkeeping(FrameConfig::with_frames(SyncTier::Sync2Timeline, 2));
+        let mut seen = std::collections::HashSet::new();
+        for image in 0..4 {
+            assert!(
+                seen.insert(r.present_semaphore(image)),
+                "image {image} repeated"
+            );
+        }
     }
 
     #[test]

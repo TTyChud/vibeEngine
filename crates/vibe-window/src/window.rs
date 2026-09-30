@@ -118,6 +118,28 @@ impl Window {
     }
 }
 
+/// The engine's window answers the raw-window-handle traits directly.
+///
+/// `egui_winit` and anything else that takes `&dyn HasDisplayHandle` expects
+/// them implemented, and wrapping a winit window in a newtype would otherwise
+/// mean every such caller has to reach through `.inner` and cannot be handed
+/// the engine's own type at all.
+impl HasDisplayHandle for Window {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        self.inner.display_handle()
+    }
+}
+
+impl HasWindowHandle for Window {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        self.inner.window_handle()
+    }
+}
+
 /// The winit application handler, which owns the window for the engine.
 struct Engine<B> {
     window: Option<Window>,

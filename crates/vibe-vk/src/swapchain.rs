@@ -335,20 +335,33 @@ impl Swapchain {
         Ok(AcquireResult::Ready { index })
     }
 
-    /// Present an image.
+    /// Present an image, waiting for the frame that rendered it.
     ///
     /// # Safety
     ///
     /// `semaphore` must be the one signalled by the submit that rendered
-    /// `image_index`.
+    /// `image_index`, or null if the caller has already synchronised another
+    /// way.
     pub unsafe fn present(
         &self,
         swapchain_loader: &SwapchainDevice,
         queue: vk::Queue,
         image_index: u32,
-        _semaphore: vk::Semaphore,
+        semaphore: vk::Semaphore,
     ) -> Result<AcquireResult, VkError> {
+        // The wait is not optional. The frame signals this semaphore when its
+        // rendering is done, and the present is what consumes it: a present
+        // that does not wait can show an image whose rendering has not
+        // finished, and a semaphore signalled and never waited on is rejected
+        // by validation on the frame that signals it next.
+        let waiting = semaphore != vk::Semaphore::null();
         let info = vk::PresentInfoKHR {
+            wait_semaphore_count: if waiting { 1 } else { 0 },
+            p_wait_semaphores: if waiting {
+                &semaphore
+            } else {
+                std::ptr::null()
+            },
             swapchain_count: 1,
             p_swapchains: &self.handle,
             p_image_indices: &image_index,

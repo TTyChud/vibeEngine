@@ -531,6 +531,11 @@ impl App {
                 }
             }
         }
+        // The GPU must be finished with the old images before their views go.
+        // Destroying a view on an image a frame is still presenting into is a
+        // use-after-free, and the driver reports that as a lost device rather
+        // than an error at the destroy, so the wait has to come first.
+        gpu.logical.wait_idle();
         // The old views belong to the old images, which the new swapchain has
         // replaced.
         for view in gpu.views.drain(..) {
@@ -542,10 +547,13 @@ impl App {
             gpu.resources
                 .resize_present_semaphores(device, images.len())
         };
-        gpu.swapchain = new;
+        // The old swapchain has to be destroyed now the new one exists. It is
+        // not dropped automatically, so without this a project that resizes a
+        // hundred times leaks a hundred swapchains, each holding its images.
+        let mut old_swapchain = std::mem::replace(&mut gpu.swapchain, new);
+        unsafe { old_swapchain.destroy(&gpu.swapchain_loader) };
         gpu.images = images;
         gpu.views = views;
-        gpu.logical.wait_idle();
         println!("[resize] swapchain rebuilt at {w}x{h}");
     }
 }

@@ -13,7 +13,7 @@
 use std::ffi::CStr;
 
 use ash::vk;
-use vibe_editor::{ContentBrowser, EditorFrame, HierarchyPanel, InspectorPanel, LogPanel, Panel};
+use vibe_editor::Editor;
 use vibe_render::ui::{ScreenTransform, build_ui_pipeline, scissor_from_bounds};
 use vibe_vk::memory::{BufferUsage, GpuBuffer, MemoryNeed};
 use vibe_window::{SurfaceKind, surface};
@@ -168,36 +168,19 @@ fn main() {
         };
     println!("[4] ui pipeline built (key {:#x})", ui_pipeline.cache_key);
 
-    // Run a real egui frame with a populated scene, so the UI has something to
+    // Run a real egui frame over a populated scene, so the UI has something to
     // draw beyond empty panels.
-    let mut world = vibe_ecs::World::new();
+    let mut editor = Editor::new();
     for name in ["Player", "Enemy", "Camera"] {
-        let e = world.spawn();
-        world.add(e, vibe_ecs::components::Tag(name.to_string()));
+        editor.spawn(name);
     }
-    let context = egui::Context::default();
-    let mut session = vibe_editor::EditorSession::new();
-    let mut hierarchy = HierarchyPanel::new();
-    let mut inspector = InspectorPanel::new();
-    let mut log_panel = LogPanel::new();
-    let mut content = ContentBrowser::new();
-    content.root = std::env::temp_dir();
-    content.rescan();
-    let mut requested_path = None;
+    editor.content.root = std::env::temp_dir();
+    editor.content.rescan();
 
-    let data = EditorFrame {
-        context: &context,
-        session: &mut session,
-        hierarchy: &mut hierarchy,
-        inspector: &mut inspector,
-        log_panel: &mut log_panel,
-        content: &mut content,
-        panel: Panel::Hierarchy,
-        viewport: egui::Vec2::new(w as f32, h as f32),
-        world: &mut world,
-        requested_path: &mut requested_path,
-    }
-    .draw();
+    let data = editor.draw(
+        egui::RawInput::default(),
+        egui::Vec2::new(w as f32, h as f32),
+    );
     println!(
         "[5] egui frame: {} batch(es), {} vertex(es), {} byte(s)",
         data.batch_count(),

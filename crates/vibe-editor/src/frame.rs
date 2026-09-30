@@ -99,7 +99,7 @@ impl EditorFrame<'_> {
     /// The whole body is wrapped so a panel that panics on malformed data
     /// cannot take the editor down with it: a crashed editor loses the user's
     /// unsaved work, which is the worst outcome available.
-    pub fn draw(mut self) -> UiDrawData {
+    pub fn draw(mut self, input: egui::RawInput) -> UiDrawData {
         // A path the host handed over is applied before the panels draw, so the
         // frame shows the scene it was asked to open. Doing it only on the Open
         // button's click would make an open depend on a click round trip, which
@@ -107,7 +107,7 @@ impl EditorFrame<'_> {
         if let Some(path) = self.requested_path.take() {
             self.open_scene(&path);
         }
-        let output = self.context.run_ui(self.take_input(), |ui| {
+        let output = self.context.run_ui(input, |ui| {
             // Wrapped because a panel that panics on malformed scene data must
             // not take the editor with it: a crashed editor loses the user's
             // unsaved work, which is the worst outcome available.
@@ -124,15 +124,6 @@ impl EditorFrame<'_> {
         let mut output = output;
         output.textures_delta.clear();
         data
-    }
-
-    /// The input for this frame.
-    ///
-    /// An empty input is right when the platform layer has not filled one in
-    /// yet: egui runs a full pass on an empty input rather than skipping, so the
-    /// panels lay out on the first frame instead of popping in later.
-    fn take_input(&self) -> egui::RawInput {
-        egui::RawInput::default()
     }
 
     /// The menu bar: file actions and the play controls.
@@ -399,6 +390,153 @@ fn vibe_editor_content_kinds() -> [ContentKind; 6] {
     ]
 }
 
+/// The editor's whole state, held across frames.
+///
+/// One object rather than a bundle of arguments per frame: the host owns this,
+/// hands it the input, and gets geometry back. Everything egui retains between
+/// frames — the hovered widget, the open panels, the scroll offsets — lives in
+/// the context inside it.
+pub struct Editor {
+    /// egui's context.
+    pub context: Context,
+    /// The session, for the mode and the scene's name.
+    pub session: EditorSession,
+    /// The scene tree.
+    pub hierarchy: HierarchyPanel,
+    /// The component inspector.
+    pub inspector: InspectorPanel,
+    /// The log panel.
+    pub log_panel: LogPanel,
+    /// The asset browser.
+    pub content: ContentBrowser,
+    /// The scene being edited.
+    pub world: vibe_ecs::World,
+    /// Which panel is open.
+    pub panel: Panel,
+    /// A path the host wants opened, consumed on the next frame.
+    pub requested_path: Option<std::path::PathBuf>,
+    /// How many frames have been drawn, for the status line.
+    pub frame_count: u64,
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for Editor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Editor")
+            .field("panel", &self.panel)
+            .field("entities", &self.world.len())
+            .field("frames", &self.frame_count)
+            .finish()
+    }
+}
+
+impl Editor {
+    /// A new editor with an empty scene.
+    pub fn new() -> Editor {
+        let context = Context::default();
+        // The engine is dark, so egui's light default reads as a foreign window
+        // pasted over a dark scene.
+        context.set_visuals(editor_visuals());
+        Editor {
+            context,
+            session: EditorSession::new(),
+            hierarchy: HierarchyPanel::new(),
+            inspector: InspectorPanel::new(),
+            log_panel: LogPanel::new(),
+            content: ContentBrowser::new(),
+            world: vibe_ecs::World::new(),
+            panel: Panel::Hierarchy,
+            requested_path: None,
+            frame_count: 0,
+        }
+    }
+
+    /// A frame's borrows, for passing to [`EditorFrame::draw`].
+    fn frame(&mut self) -> EditorFrame<'_> {
+        EditorFrame {
+            context: &self.context,
+            session: &mut self.session,
+            hierarchy: &mut self.hierarchy,
+            inspector: &mut self.inspector,
+            log_panel: &mut self.log_panel,
+            content: &mut self.content,
+            panel: self.panel,
+            viewport: egui::Vec2::ZERO,
+            world: &mut self.world,
+            requested_path: &mut self.requested_path,
+        }
+    }
+
+    /// Draw one frame from the input the platform layer gathered.
+    pub fn draw(&mut self, input: egui::RawInput, viewport: egui::Vec2) -> UiDrawData {
+        self.frame_count += 1;
+        let mut frame = self.frame();
+        frame.viewport = viewport;
+        frame.draw(input)
+    }
+
+    /// Spawn an entity with a tag, for a host building a starting scene.
+    pub fn spawn(&mut self, name: &str) -> vibe_ecs::Entity {
+        let e = self.world.spawn();
+        self.world
+            .add(e, vibe_ecs::components::Tag(name.to_string()));
+        e
+    }
+
+    /// Open another panel, or close the current one.
+    pub fn toggle_panel(&mut self, panel: Panel) {
+        self.panel = if self.panel == panel {
+            Panel::None
+        } else {
+            panel
+        };
+    }
+
+    /// Handle a shortcut, returning true when it was consumed.
+    ///
+    /// The host must not also pass the key to the camera when this returns
+    /// true, or F1 would both switch panels and move the view.
+    pub fn handle_shortcut(&mut self) -> bool {
+        let shortcuts = [
+            (egui::Key::F1, Panel::Hierarchy),
+            (egui::Key::F2, Panel::Inspector),
+            (egui::Key::F3, Panel::Content),
+            (egui::Key::F4, Panel::Log),
+        ];
+        let hit = self
+            .context
+            .input_mut(|i| shortcuts.iter().find(|(k, _)| i.key_pressed(*k)).copied());
+        if let Some((_, panel)) = hit {
+            self.toggle_panel(panel);
+            return true;
+        }
+        if self.context.input_mut(|i| i.key_pressed(egui::Key::Escape)) {
+            // Escape backs out of a pending open before it closes a panel, so a
+            // user who opened a dialog does not lose their panel as well.
+            if self.requested_path.take().is_some() {
+                return true;
+            }
+            self.panel = Panel::None;
+            return true;
+        }
+        false
+    }
+}
+
+/// The dark visuals the editor's panels are drawn with.
+fn editor_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = egui::Color32::from_rgb(28, 30, 36);
+    visuals.window_fill = visuals.panel_fill;
+    visuals.extreme_bg_color = egui::Color32::from_rgb(18, 19, 23);
+    visuals
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,7 +618,7 @@ mod tests {
 
     fn draw_once(panel: Panel) -> UiDrawData {
         let mut p = parts();
-        p.frame(panel).draw()
+        p.frame(panel).draw(egui::RawInput::default())
     }
 
     #[test]
@@ -530,7 +668,7 @@ mod tests {
         let e = p.world.spawn();
         p.world
             .add(e, vibe_ecs::components::Tag("Hero".to_string()));
-        let d = p.frame(Panel::Hierarchy).draw();
+        let d = p.frame(Panel::Hierarchy).draw(egui::RawInput::default());
         assert!(!d.is_empty());
         assert_eq!(p.hierarchy.last_row_count, 1, "the entity is listed");
     }
@@ -547,7 +685,7 @@ mod tests {
         let e = p.world.spawn();
         p.world.despawn(e);
         p.session.selection = Some(e);
-        let d = p.frame(Panel::Inspector).draw();
+        let d = p.frame(Panel::Inspector).draw(egui::RawInput::default());
         assert!(!d.is_empty(), "a stale selection is reported, not fatal");
         assert!(
             p.session.selection.is_none(),
@@ -579,7 +717,7 @@ mod tests {
         assert!(!p.session.dirty, "saving clears the dirty flag");
 
         let mut q = parts_with_open(&path);
-        q.frame(Panel::None).draw();
+        q.frame(Panel::None).draw(egui::RawInput::default());
         assert_eq!(q.world.len(), 1, "the entity came back");
         assert_eq!(q.session.path.as_deref(), Some(path.as_path()));
         let _ = std::fs::remove_file(&path);
@@ -595,7 +733,7 @@ mod tests {
         p.frame(Panel::None).save_scene(&path);
 
         let mut q = parts_with_open(&path);
-        q.frame(Panel::None).draw();
+        q.frame(Panel::None).draw(egui::RawInput::default());
         let found = q
             .world
             .entities()
@@ -609,7 +747,7 @@ mod tests {
     fn opening_a_missing_file_leaves_the_scene_alone() {
         let mut p = parts_with_open(std::path::Path::new("/nonexistent-scene.yaml"));
         let e = p.world.spawn();
-        p.frame(Panel::None).draw();
+        p.frame(Panel::None).draw(egui::RawInput::default());
         assert_eq!(p.world.len(), 1, "the existing entity survives a bad open");
         assert!(p.world.is_alive(e));
         assert!(
@@ -624,7 +762,7 @@ mod tests {
         std::fs::write(&path, "this: is: not: valid: yaml: [[[").unwrap();
         let mut p = parts_with_open(&path);
         let e = p.world.spawn();
-        p.frame(Panel::None).draw();
+        p.frame(Panel::None).draw(egui::RawInput::default());
         assert_eq!(
             p.world.len(),
             1,
@@ -644,13 +782,13 @@ mod tests {
         p.world.spawn();
 
         p.requested_path = Some(path.clone());
-        p.frame(Panel::None).draw();
+        p.frame(Panel::None).draw(egui::RawInput::default());
         assert_eq!(p.world.len(), 1, "the open replaced the two-entity world");
         assert!(
             p.requested_path.is_none(),
             "the path is consumed, not left to reopen every frame"
         );
-        p.frame(Panel::None).draw();
+        p.frame(Panel::None).draw(egui::RawInput::default());
         assert_eq!(p.world.len(), 1, "and it does not reopen");
         let _ = std::fs::remove_file(&path);
     }
@@ -668,7 +806,7 @@ mod tests {
         let mut q = parts_with_open(&path);
         let old = q.world.spawn();
         q.session.selection = Some(old);
-        q.frame(Panel::None).draw();
+        q.frame(Panel::None).draw(egui::RawInput::default());
         assert!(
             q.session.selection.is_none(),
             "a handle into the previous world would select nothing"
@@ -679,7 +817,7 @@ mod tests {
     #[test]
     fn the_content_panel_with_no_root_says_so() {
         let mut p = parts();
-        let d = p.frame(Panel::Content).draw();
+        let d = p.frame(Panel::Content).draw(egui::RawInput::default());
         assert!(!d.is_empty());
     }
 
@@ -691,7 +829,7 @@ mod tests {
         let mut p = parts();
         p.content = ContentBrowser::at(&dir);
         p.content.rescan();
-        let d = p.frame(Panel::Content).draw();
+        let d = p.frame(Panel::Content).draw(egui::RawInput::default());
         assert!(!d.is_empty());
         assert_eq!(p.content.entries.len(), 1, "{:?}", p.content.entries);
         let _ = std::fs::remove_dir_all(&dir);
@@ -710,6 +848,130 @@ mod tests {
         p.content.filter = "hero".to_string();
         assert_eq!(p.content.visible_count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_editor_has_an_empty_scene_and_the_hierarchy_open() {
+        let e = Editor::new();
+        assert_eq!(e.world.len(), 0);
+        assert_eq!(e.panel, Panel::Hierarchy);
+        assert_eq!(e.frame_count, 0);
+    }
+
+    #[test]
+    fn drawing_counts_frames() {
+        let mut e = Editor::new();
+        e.draw(egui::RawInput::default(), egui::Vec2::new(1280.0, 720.0));
+        assert_eq!(e.frame_count, 1);
+    }
+
+    #[test]
+    fn a_draw_produces_geometry() {
+        let mut e = Editor::new();
+        let d = e.draw(egui::RawInput::default(), egui::Vec2::new(1280.0, 720.0));
+        assert!(!d.is_empty(), "the loop produced no geometry");
+    }
+
+    #[test]
+    fn spawning_tags_the_entity() {
+        let mut e = Editor::new();
+        let handle = e.spawn("Hero");
+        let tag = e.world.get::<vibe_ecs::components::Tag>(handle);
+        assert_eq!(tag.map(|t| t.0.as_str()), Some("Hero"));
+    }
+
+    #[test]
+    fn toggling_a_panel_opens_then_closes_it() {
+        let mut e = Editor::new();
+        e.toggle_panel(Panel::Log);
+        assert_eq!(e.panel, Panel::Log);
+        e.toggle_panel(Panel::Log);
+        assert_eq!(e.panel, Panel::None);
+    }
+
+    #[test]
+    fn toggling_to_a_different_panel_switches_rather_than_closes() {
+        let mut e = Editor::new();
+        e.toggle_panel(Panel::Log);
+        e.toggle_panel(Panel::Content);
+        assert_eq!(e.panel, Panel::Content);
+    }
+
+    #[test]
+    fn a_shortcut_with_no_press_is_not_consumed() {
+        let mut e = Editor::new();
+        assert!(!e.handle_shortcut(), "an empty input consumes nothing");
+    }
+
+    /// Feed the context an event and throw away the pass it produces.
+    ///
+    /// The output's texture delta has to be cleared even when nothing is drawn
+    /// with it, which is exactly the rule the real frame follows.
+    fn feed(context: &Context, event: egui::Event) {
+        let mut input = egui::RawInput::default();
+        input.events.push(event);
+        let mut out = context.run_ui(input, |_ui| {});
+        out.textures_delta.clear();
+    }
+
+    fn key_event(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    #[test]
+    fn a_pressed_function_key_switches_panels() {
+        let mut e = Editor::new();
+        // A pass is needed to make the context see the key, and the shortcut is
+        // checked after it, the way a host's frame loop would.
+        feed(&e.context, key_event(egui::Key::F4));
+        let _ = e.handle_shortcut();
+        assert_eq!(e.panel, Panel::Log, "F4 opens the log");
+    }
+
+    #[test]
+    fn escape_clears_a_pending_open_before_closing_a_panel() {
+        let mut e = Editor::new();
+        e.requested_path = Some(std::path::PathBuf::from("/tmp/whatever.yaml"));
+        feed(&e.context, key_event(egui::Key::Escape));
+        e.handle_shortcut();
+        assert!(e.requested_path.is_none(), "the pending open is dropped");
+        assert_eq!(e.panel, Panel::Hierarchy, "and the panel survives");
+    }
+
+    #[test]
+    fn the_debug_form_reports_the_scene_size() {
+        let mut e = Editor::new();
+        e.spawn("A");
+        e.spawn("B");
+        let s = format!("{e:?}");
+        assert!(s.contains("entities: 2"), "{s}");
+    }
+
+    #[test]
+    fn the_editor_visuals_are_dark() {
+        let v = editor_visuals();
+        assert!(v.dark_mode, "the panels must match the dark scene");
+    }
+
+    #[test]
+    fn the_editor_panel_fill_is_darker_than_the_text() {
+        // A panel the same brightness as its own text is unreadable, and it is
+        // the kind of mistake that only shows once someone runs the editor.
+        let v = editor_visuals();
+        let fill = v.panel_fill.to_srgba_unmultiplied();
+        let text = v
+            .override_text_color
+            .map(|c| c.to_srgba_unmultiplied())
+            .unwrap_or([255, 255, 255, 255]);
+        let fill_lum = fill[0] as u32 + fill[1] as u32 + fill[2] as u32;
+        let text_lum = text[0] as u32 + text[1] as u32 + text[2] as u32;
+        assert!(text_lum > fill_lum, "text {text:?} on fill {fill:?}");
     }
 
     #[test]

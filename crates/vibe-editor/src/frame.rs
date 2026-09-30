@@ -84,6 +84,12 @@ pub struct EditorFrame<'a> {
     pub window_size: egui::Vec2,
     /// The scene, for the hierarchy and inspector to read.
     pub world: &'a mut vibe_ecs::World,
+    /// The 3D boxes, which the viewport picks from and the frame writes to.
+    ///
+    /// The viewport takes a shared borrow of this — it only needs to know where
+    /// the boxes are — and the frame applies whatever the viewport decided. That
+    /// split is what stops the UI layer from spawning entities itself.
+    pub boxes: &'a mut crate::box_scene::BoxScene,
     /// The scene area, with the gizmo over it.
     pub scene_viewport: &'a mut crate::viewport::Viewport,
     /// The camera the viewport is seen through.
@@ -97,6 +103,12 @@ pub struct EditorFrame<'a> {
     pub requested_path: &'a mut Option<std::path::PathBuf>,
     /// The font atlas last seen, carried across the frames egui sends none for.
     pub last_atlas: &'a mut crate::ui_bridge::FontAtlas,
+    /// Where the pointer was, in viewport pixels, from the last frame.
+    ///
+    /// Kept rather than read from egui again because the resize and placement
+    /// rays are built *after* the viewport panel has closed — by then egui's
+    /// hover state belongs to whatever panel is current, not to the scene.
+    pub last_pointer: &'a mut glam::Vec2,
 }
 
 impl EditorFrame<'_> {
@@ -299,11 +311,131 @@ impl EditorFrame<'_> {
         // hides every box — while the gizmo, drawn afterwards as egui shapes,
         // still appears on top, which is what makes it look like a scene with
         // nothing in it rather than a UI bug.
+        //
+        // The action is applied *after* the panel closes, because applying it
+        // inside would need a mutable borrow of the scene while the viewport
+        // still holds a shared one of it.
+        let selected = self.session.selection;
+        let resizing = self.boxes.resizing();
+        let mut action = crate::box_scene::ViewportAction::None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::TRANSPARENT))
             .show(ui, |ui| {
-                self.scene_viewport.show(ui, self.camera);
+                let interaction = self.scene_viewport.show(
+                    ui,
+                    self.camera,
+                    &self.boxes.boxes,
+                    selected,
+                    resizing,
+                );
+                // Kept for the resize and placement rays, which are built after
+                // the panel closes. The viewport could report it instead, but a
+                // pointer position is not a scene decision and does not belong
+                // in an action the scene has to interpret.
+                *self.last_pointer = interaction.pointer;
+                action = interaction.action;
             });
+        self.apply_viewport_action(action);
+    }
+
+    /// Act on what the viewport reported.
+    ///
+    /// Every mutation to the scene happens here, in one function: spawning an
+    /// entity, changing a selection, and resizing a box. Keeping them together
+    /// is what makes the rules checkable — there is exactly one place that
+    /// writes a box's transform, and it is also the one that spawns the entity
+    /// the transform belongs to.
+    fn apply_viewport_action(&mut self, action: crate::box_scene::ViewportAction) {
+        use crate::box_scene::ViewportAction;
+        match action {
+            ViewportAction::None => {}
+            ViewportAction::Select(entity) => {
+                self.hierarchy.select(entity);
+                self.session.selection = Some(entity);
+                self.session.mark_dirty();
+            }
+            ViewportAction::BeginResizeCorner { corner } => {
+                // The handle is only drawn on the selected box, so the selection
+                // is the box being resized.
+                let Some(entity) = self.session.selection else {
+                    return;
+                };
+                self.boxes
+                    .begin_resize(entity, crate::box_scene::ResizeHandle::Corner(corner));
+            }
+            ViewportAction::Resizing { entity } => {
+                // The cursor's world position is needed to size the box, and it
+                // is not in the action: the frame has the viewport rect and the
+                // camera, so the ray is built here rather than in the viewport,
+                // which would need to pass the pointer back out.
+                let Some(target) = self.resize_target_for(entity) else {
+                    return;
+                };
+                if self.boxes.update_resize(target).is_some() {
+                    self.boxes.sync_transform(entity, self.world);
+                    self.session.mark_dirty();
+                }
+            }
+            ViewportAction::Place => {
+                let Some(position) = self.ground_under_pointer() else {
+                    return;
+                };
+                self.place_box_at(position);
+            }
+        }
+    }
+
+    /// The world position a resize handle should move to, from the pointer.
+    fn resize_target_for(&self, entity: vibe_ecs::Entity) -> Option<glam::Vec3> {
+        let b = self.boxes.get(entity)?;
+        let size = self.viewport_size();
+        let ray = crate::gizmo::screen_ray_with_camera(*self.last_pointer, self.camera, size)?;
+        crate::box_scene::resize_target(&ray, b.position, self.camera.position)
+    }
+
+    /// The viewport's size in world-space maths units.
+    ///
+    /// The viewport rect is an egui rectangle in points, and the ray maths wants
+    /// a glam vector. Converting here rather than at each call site is what keeps
+    /// the two from being confused: an `egui::Vec2` and a `glam::Vec2` are
+    /// distinct types that both mean "a screen position", and passing one where
+    /// the other is wanted is a type error rather than a silent mistake — which
+    /// is the only reason this is not a bug that shipped.
+    fn viewport_size(&self) -> glam::Vec2 {
+        let r = self.scene_viewport.rect;
+        glam::Vec2::new(r.width(), r.height())
+    }
+
+    /// Where on the ground the pointer is, if it is over the ground at all.
+    fn ground_under_pointer(&self) -> Option<glam::Vec3> {
+        let ray = crate::gizmo::screen_ray_with_camera(
+            *self.last_pointer,
+            self.camera,
+            self.viewport_size(),
+        )?;
+        crate::box_scene::ground_position(&ray, 0.0)
+    }
+
+    /// Spawn a box at a world position and select it.
+    fn place_box_at(&mut self, position: glam::Vec3) {
+        let e = self.world.spawn();
+        self.world.add(
+            e,
+            vibe_ecs::components::Tag(format!("Box {}", self.boxes.boxes.len() + 1)),
+        );
+        // Placed at the cursor rather than on the placement grid: the user chose
+        // this spot, and snapping it to a grid would put the box somewhere they
+        // did not click.
+        self.boxes.boxes.push(crate::box_scene::SceneBox {
+            entity: e,
+            position,
+            size: crate::box_scene::DEFAULT_BOX_SIZE,
+            ..crate::box_scene::SceneBox::new(e)
+        });
+        self.boxes.sync_transform(e, self.world);
+        self.hierarchy.select(e);
+        self.session.selection = Some(e);
+        self.session.mark_dirty();
     }
 
     /// Load a scene from disk into the world.
@@ -418,6 +550,58 @@ impl EditorFrame<'_> {
             if !size.is_empty() {
                 ui.label(format!("Size: {size}"));
             }
+            // The path is cloned out before the buttons are drawn: the entry is
+            // borrowed from `self.content`, and the buttons mutate the scene, so
+            // holding the borrow across them is a borrow conflict rather than a
+            // design problem. A path is two words of heap, and the panel is drawn
+            // once a frame.
+            let path = entry.path.clone();
+            self.draw_texture_actions(ui, &path);
+        }
+    }
+
+    /// The texture controls for the selected box.
+    ///
+    /// Only offered when a box is selected *and* a decodable image is chosen,
+    /// because both halves are needed: applying a texture to nothing, or offering
+    /// a button that would fail on an unsupported file, are both ways for a user
+    /// to press something and get nothing.
+    fn draw_texture_actions(&mut self, ui: &mut egui::Ui, path: &std::path::Path) {
+        // Checked before the buttons: a file the decoder cannot read is not
+        // offered as a choice at all, rather than offered and failing on click.
+        if !vibe_render::texture::is_supported(path) {
+            return;
+        }
+        let Some(entity) = self.session.selection else {
+            ui.label("Select a box to texture it");
+            return;
+        };
+        if self.boxes.get(entity).is_none() {
+            ui.label("Select a box to texture it");
+            return;
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Apply to selected box").clicked() {
+                if self.boxes.set_texture(entity, Some(path.to_path_buf())) {
+                    self.session.mark_dirty();
+                    log::info!("textured {:?} with {}", entity, path.display());
+                }
+            }
+            let textured = self.boxes.get(entity).is_some_and(|b| b.texture.is_some());
+            if textured && ui.button("Clear").clicked() {
+                self.boxes.set_texture(entity, None);
+                self.session.mark_dirty();
+            }
+        });
+        // The current texture, so the user can see what a box has without
+        // having to remember which file they picked.
+        if let Some(current) = self
+            .boxes
+            .get(entity)
+            .and_then(|b| b.texture.as_ref())
+            .and_then(|p| p.file_name())
+        {
+            ui.label(format!("Texture: {}", current.to_string_lossy()));
         }
     }
 }
@@ -477,6 +661,12 @@ pub struct Editor {
     pub last_atlas: crate::ui_bridge::FontAtlas,
     /// How many frames have been drawn, for the status line.
     pub frame_count: u64,
+    /// Where the pointer was in the viewport last frame, in pixels.
+    ///
+    /// Held here rather than read from egui at the point of use, because the
+    /// resize and placement rays are built after the viewport panel has closed
+    /// and egui's hover state then belongs to whatever panel is current.
+    pub last_pointer: glam::Vec2,
 }
 
 impl Default for Editor {
@@ -517,6 +707,7 @@ impl Editor {
             requested_path: None,
             last_atlas: crate::ui_bridge::FontAtlas::default(),
             frame_count: 0,
+            last_pointer: glam::Vec2::ZERO,
         }
     }
 
@@ -532,10 +723,12 @@ impl Editor {
             panel: self.panel,
             window_size: egui::Vec2::ZERO,
             world: &mut self.world,
+            boxes: &mut self.boxes,
             scene_viewport: &mut self.viewport,
             camera: &self.camera,
             requested_path: &mut self.requested_path,
             last_atlas: &mut self.last_atlas,
+            last_pointer: &mut self.last_pointer,
         }
     }
 
@@ -676,10 +869,12 @@ mod tests {
             log_panel: LogPanel::new(),
             content: ContentBrowser::new(),
             world: vibe_ecs::World::new(),
+            boxes: crate::box_scene::BoxScene::new(),
             scene_viewport: crate::viewport::Viewport::new(),
             camera: crate::camera::EditorCamera::perspective(),
             requested_path: None,
             last_atlas: crate::ui_bridge::FontAtlas::default(),
+            last_pointer: glam::Vec2::ZERO,
         }
     }
 
@@ -695,6 +890,8 @@ mod tests {
         camera: crate::camera::EditorCamera,
         requested_path: Option<std::path::PathBuf>,
         last_atlas: crate::ui_bridge::FontAtlas,
+        boxes: crate::box_scene::BoxScene,
+        last_pointer: glam::Vec2,
     }
 
     impl Parts {
@@ -713,6 +910,8 @@ mod tests {
                 world: &mut self.world,
                 requested_path: &mut self.requested_path,
                 last_atlas: &mut self.last_atlas,
+                boxes: &mut self.boxes,
+                last_pointer: &mut self.last_pointer,
             }
         }
     }

@@ -12,8 +12,20 @@
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui};
 use glam::{Mat4, Vec2, Vec3};
 
+use crate::box_scene::{
+    CORNER_PICK_RADIUS, ResizeHandle, SceneBox, SceneInteraction, ViewportAction, ground_position,
+    pick_box, pick_corner, projected_corners,
+};
 use crate::camera::EditorCamera;
-use crate::gizmo::{GizmoAxis, GizmoDrag, ProjectedHandle, pick, project_handles};
+use crate::gizmo::{
+    GizmoAxis, GizmoDrag, ProjectedHandle, pick, project_handles, screen_ray_with_camera,
+};
+
+/// How big a corner handle is drawn, in pixels.
+const CORNER_RADIUS: f32 = 5.0;
+
+/// The colour a corner handle is drawn in.
+const CORNER: Color32 = Color32::from_rgb(240, 240, 240);
 
 /// How long a gizmo handle is on screen, in pixels.
 ///
@@ -103,8 +115,8 @@ impl Viewport {
     }
 
     /// The axis a click at `cursor` would grab, given the current handles.
-    pub fn axis_at(&self, camera: &EditorCamera, size: Vec2, cursor: Pos2) -> GizmoAxis {
-        pick(&self.handles(camera, size), Vec2::new(cursor.x, cursor.y))
+    pub fn axis_at(&self, camera: &EditorCamera, size: Vec2, cursor: Vec2) -> GizmoAxis {
+        pick(&self.handles(camera, size), cursor)
     }
 
     /// Handle a click: start a drag on whatever is under the cursor.
@@ -112,7 +124,7 @@ impl Viewport {
     /// Returns the axis grabbed, or `None` when the click missed every handle —
     /// which is not an error but the common case, since most clicks in a
     /// viewport are not on a gizmo.
-    pub fn begin_drag(&mut self, camera: &EditorCamera, size: Vec2, cursor: Pos2) -> GizmoAxis {
+    pub fn begin_drag(&mut self, camera: &EditorCamera, size: Vec2, cursor: Vec2) -> GizmoAxis {
         let axis = self.axis_at(camera, size, cursor);
         if axis == GizmoAxis::None {
             return GizmoAxis::None;
@@ -120,6 +132,16 @@ impl Viewport {
         self.drag = GizmoDrag::begin(axis, self.gizmo_origin, self.gizmo_origin);
         self.last_grabbed = axis;
         axis
+    }
+
+    /// The viewport's size, in the units the gizmo's maths uses.
+    ///
+    /// The rect is an egui rectangle in points; the projection and picking take
+    /// a glam vector. Keeping the conversion in one method is what stops the two
+    /// being confused at a call site — and they are distinct types, so a mistake
+    /// here is a compile error rather than a wrong answer.
+    fn viewport_size(&self) -> Vec2 {
+        Vec2::new(self.rect.width(), self.rect.height())
     }
 
     /// Move a drag to a cursor, returning the distance travelled along the axis.
@@ -168,29 +190,164 @@ impl Viewport {
     /// The gizmo is painted rather than laid out, so it costs no space and does
     /// not push the panels around; the whole viewport is one sense-checking
     /// rect that takes clicks.
-    pub fn show(&mut self, ui: &mut Ui, camera: &EditorCamera) {
+    ///
+    /// `boxes` is read, never written: the viewport reports what the pointer did
+    /// through the returned [`SceneInteraction`] and the frame that owns the
+    /// scene applies it. That is what keeps entity creation and transform writes
+    /// in one place instead of spread across the UI.
+    ///
+    /// The three kinds of click are tried in order of specificity: a corner
+    /// handle, then the axis gizmo, then a box, then the ground. Corner first
+    /// because it is the smallest target and the one a user aims at precisely;
+    /// ground last because it is the fallback that catches everything else.
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        camera: &EditorCamera,
+        boxes: &[SceneBox],
+        selected: Option<vibe_ecs::Entity>,
+        resizing: Option<(vibe_ecs::Entity, usize)>,
+    ) -> SceneInteraction {
         let (response, painter) =
             ui.allocate_painter(ui.available_size_before_wrap(), Sense::click_and_drag());
         self.rect = response.rect;
         let size = Vec2::new(response.rect.width(), response.rect.height());
 
         let pointer = response.hover_pos().unwrap_or(Pos2::ZERO);
-        self.hovered = if response.hovered() && !self.is_dragging() {
-            self.axis_at(camera, size, pointer)
+        let cursor = Vec2::new(pointer.x, pointer.y);
+
+        // The corners of the selected box are the resize handles. Only the
+        // selected box gets them: eight handles per box would be a thicket, and
+        // the selected box is the one the user is working on.
+        let corner_handles: Vec<(usize, Vec2)> = selected
+            .and_then(|e| boxes.iter().find(|b| b.entity == e))
+            .map(|b| projected_corners(b, camera, size))
+            .unwrap_or_default();
+
+        // Highlight the corner under the cursor, except while a drag owns the
+        // pointer — during a resize the cursor is by definition not on a corner.
+        let hovered_corner = if response.hovered() && resizing.is_none() {
+            match pick_corner(&corner_handles, cursor, CORNER_PICK_RADIUS) {
+                Some(ResizeHandle::Corner(i)) => Some(i),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let mut action = ViewportAction::None;
+        if response.drag_started() {
+            action = self.begin_scene_drag(camera, &corner_handles, cursor, boxes);
+        }
+        // A drag in progress keeps reporting, so the frame applies the resize
+        // every frame the cursor moves rather than only on release.
+        if response.dragged()
+            && let Some((entity, _)) = resizing
+        {
+            action = ViewportAction::Resizing { entity };
+        }
+        // The gizmo's hover is set here rather than in `begin_scene_drag`, so a
+        // hover is tracked on a plain mouse move — a click is not the only time
+        // a user points at something.
+        self.hovered = if response.hovered() && resizing.is_none() {
+            self.axis_at(camera, size, cursor)
         } else {
             GizmoAxis::None
         };
 
-        if response.drag_started() {
-            self.begin_drag(camera, size, pointer);
+        self.paint(
+            &painter,
+            camera,
+            size,
+            &corner_handles,
+            hovered_corner,
+            resizing,
+        );
+        SceneInteraction {
+            action,
+            resizing: resizing.is_some(),
+            hovered_corner,
+            hovered_axis: self.hovered,
+            handle_count: corner_handles.len(),
+            pointer: cursor,
         }
-        if response.dragged() {
-            self.update_drag(pointer);
-        }
-        if response.drag_stopped() {
-            self.end_drag();
-        }
+    }
 
+    /// Decide what a click that just started means.
+    ///
+    /// Tried in order of specificity: a corner of the selected box, then the
+    /// axis gizmo, then a box, then the ground. Corner first because it is the
+    /// smallest target and the one a user aims at precisely; ground last because
+    /// it is the fallback that catches everything else.
+    fn begin_scene_drag(
+        &mut self,
+        camera: &EditorCamera,
+        corner_handles: &[(usize, Vec2)],
+        cursor: Vec2,
+        boxes: &[SceneBox],
+    ) -> ViewportAction {
+        // 1. A corner of the selected box, which starts a resize.
+        if let Some(ResizeHandle::Corner(index)) =
+            pick_corner(corner_handles, cursor, CORNER_PICK_RADIUS)
+        {
+            // The entity is not in this frame's arguments, so the caller pairs
+            // this with the selection it already knows.
+            return ViewportAction::BeginResizeCorner { corner: index };
+        }
+        // 2. The axis gizmo, which moves the selection along an axis. The
+        // gizmo's own helpers take glam vectors, because they do the same
+        // projection maths the ray does.
+        if self.axis_at(camera, self.viewport_size(), cursor) != GizmoAxis::None {
+            self.begin_drag(camera, self.viewport_size(), cursor);
+            return ViewportAction::None;
+        }
+        // 3. A box under the cursor, which selects it.
+        let size = self.viewport_size();
+        let Some(ray) = screen_ray_with_camera(cursor, camera, size) else {
+            return ViewportAction::None;
+        };
+        if let Some(b) = pick_box(boxes, &ray) {
+            return ViewportAction::Select(b.entity);
+        }
+        // 4. Empty ground, which places a new box.
+        if ground_position(&ray, 0.0).is_some() {
+            return ViewportAction::Place;
+        }
+        ViewportAction::None
+    }
+
+    /// Paint the gizmo and the corner handles.
+    fn paint(
+        &mut self,
+        painter: &egui::Painter,
+        camera: &EditorCamera,
+        size: Vec2,
+        corner_handles: &[(usize, Vec2)],
+        hovered_corner: Option<usize>,
+        resizing: Option<(vibe_ecs::Entity, usize)>,
+    ) {
+        self.draw_gizmo(painter, camera, size);
+        let dragging_corner = resizing.map(|(_, i)| i);
+        for (index, screen) in corner_handles {
+            let at = Pos2::new(screen.x, screen.y);
+            // A dark outline first, so a handle is visible against both a light
+            // texture and the dark backdrop.
+            painter.add(egui::Shape::circle_filled(
+                at,
+                CORNER_RADIUS + 2.0,
+                Color32::from_black_alpha(140),
+            ));
+            let colour = if dragging_corner == Some(*index) || hovered_corner == Some(*index) {
+                HIGHLIGHT
+            } else {
+                CORNER
+            };
+            painter.add(egui::Shape::circle_filled(at, CORNER_RADIUS, colour));
+        }
+    }
+
+    /// Paint the axis gizmo.
+    fn draw_gizmo(&mut self, painter: &egui::Painter, camera: &EditorCamera, size: Vec2) {
         let handles = self.handles(camera, size);
         self.handle_count = handles.len();
         if handles.is_empty() {
@@ -310,7 +467,7 @@ mod tests {
         let handles = v.handles(&camera(), size());
         let h = handles[0];
         let mid = (h.origin + h.tip) * 0.5;
-        let axis = v.axis_at(&camera(), size(), Pos2::new(mid.x, mid.y));
+        let axis = v.axis_at(&camera(), size(), Vec2::new(mid.x, mid.y));
         assert_eq!(axis, h.axis);
     }
 
@@ -318,7 +475,7 @@ mod tests {
     fn a_cursor_far_from_the_gizmo_picks_nothing() {
         let v = Viewport::new();
         assert_eq!(
-            v.axis_at(&camera(), size(), Pos2::new(5.0, 5.0)),
+            v.axis_at(&camera(), size(), Vec2::new(5.0, 5.0)),
             GizmoAxis::None
         );
     }
@@ -329,7 +486,7 @@ mod tests {
         let handles = v.handles(&camera(), size());
         let h = handles[0];
         let mid = (h.origin + h.tip) * 0.5;
-        let axis = v.begin_drag(&camera(), size(), Pos2::new(mid.x, mid.y));
+        let axis = v.begin_drag(&camera(), size(), Vec2::new(mid.x, mid.y));
         assert_eq!(axis, h.axis);
         assert!(v.is_dragging());
         assert_eq!(v.last_grabbed, h.axis);
@@ -338,7 +495,7 @@ mod tests {
     #[test]
     fn a_click_off_the_gizmo_starts_nothing() {
         let mut v = Viewport::new();
-        let axis = v.begin_drag(&camera(), size(), Pos2::new(3.0, 3.0));
+        let axis = v.begin_drag(&camera(), size(), Vec2::new(3.0, 3.0));
         assert_eq!(axis, GizmoAxis::None);
         assert!(!v.is_dragging());
     }
@@ -349,7 +506,7 @@ mod tests {
         let handles = v.handles(&camera(), size());
         let h = handles[0];
         let mid = (h.origin + h.tip) * 0.5;
-        v.begin_drag(&camera(), size(), Pos2::new(mid.x, mid.y));
+        v.begin_drag(&camera(), size(), Vec2::new(mid.x, mid.y));
         v.update_drag(Pos2::new(mid.x + 30.0, mid.y));
         let ended = v.end_drag();
         assert!(ended.is_some());
@@ -367,7 +524,7 @@ mod tests {
         let mut v = Viewport::new();
         v.show_gizmo = false;
         assert_eq!(
-            v.begin_drag(&camera(), size(), Pos2::new(400.0, 300.0)),
+            v.begin_drag(&camera(), size(), Vec2::new(400.0, 300.0)),
             GizmoAxis::None
         );
     }

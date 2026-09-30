@@ -12,7 +12,7 @@ use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use crate::camera::EditorCamera;
 
 /// Which handle the user grabbed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GizmoAxis {
     /// The X axis.
     X,
@@ -23,6 +23,7 @@ pub enum GizmoAxis {
     /// The screen-plane handle, which moves in two axes at once.
     Screen,
     /// No handle: the click missed.
+    #[default]
     None,
 }
 
@@ -317,6 +318,161 @@ impl GizmoDrag {
     pub fn is_active(&self) -> bool {
         self.axis != GizmoAxis::None
     }
+}
+
+/// A ray in world space: where it starts and the direction it travels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ray {
+    /// A point on the ray, normally the camera's position.
+    pub origin: Vec3,
+    /// The unit direction the ray travels in.
+    pub direction: Vec3,
+}
+
+impl Ray {
+    /// The point at `distance` along the ray.
+    pub fn at(&self, distance: f32) -> Vec3 {
+        self.origin + self.direction * distance
+    }
+
+    /// Where this ray meets a plane through `point` with the given normal.
+    ///
+    /// `None` when the ray is parallel to the plane, or points away from it. Both
+    /// are ordinary situations rather than errors: a resize drag whose ray never
+    /// crosses the plane the handle lives in has no answer, and returning `None`
+    /// lets the caller leave the box where it is instead of snapping it to
+    /// infinity.
+    pub fn intersect_plane(&self, point: Vec3, normal: Vec3) -> Option<Vec3> {
+        let denom = self.direction.dot(normal);
+        // A ray almost parallel to the plane gives a wildly distant
+        // intersection, so a small denominator is treated as parallel rather than
+        // divided by. The threshold is on the cosine, so it is a real angle.
+        if denom.abs() < 1.0e-4 {
+            return None;
+        }
+        let t = (point - self.origin).dot(normal) / denom;
+        if t < 0.0 {
+            return None;
+        }
+        Some(self.at(t))
+    }
+}
+
+/// The ray through a screen position, from a camera and a viewport.
+///
+/// This is the inverse of [`project`], and it is what turns a mouse position into
+/// a place in the scene. Resizing a box in three dimensions cannot be driven from
+/// screen pixels alone: the cursor has to be turned into a world position, and
+/// the only correct way to do that is to undo the same matrices the projection
+/// applied.
+///
+/// The ray is built from two unprojected points rather than from a single
+/// unprojected one, because a point unprojected at NDC depth 0 lands on the near
+/// plane and says nothing about direction. Two depths give a line, and the
+/// direction is the difference between them normalised.
+///
+/// The Y flip is undone here explicitly rather than being left to the matrix
+/// inverse, so that this and [`project`] are visibly a pair: a ray that does not
+/// come back out under the pointer is the signature of the two disagreeing about
+/// which way is up.
+pub fn screen_ray(cursor: Vec2, view_projection: Mat4, viewport: Vec2) -> Option<Ray> {
+    if viewport.x <= 0.0 || viewport.y <= 0.0 {
+        return None;
+    }
+    // Screen pixels to NDC, undoing the Y flip `project` applies.
+    let ndc_x = (cursor.x / viewport.x) * 2.0 - 1.0;
+    let ndc_y = 1.0 - (cursor.y / viewport.y) * 2.0;
+    let unproject = |ndc: Vec3| {
+        let clip = view_projection.inverse() * ndc.extend(1.0);
+        // A point at infinity comes back with a w near zero, which is not a
+        // position and would make the direction meaningless.
+        if !clip.w.is_finite() || clip.w.abs() < 1.0e-6 {
+            return None;
+        }
+        Some(clip.truncate() / clip.w)
+    };
+    // Two depths, so the ray is a direction and not a single point. The near
+    // plane is negative because the view space is right-handed with what is in
+    // front at -Z, which is the same convention the projection is built for.
+    let near = unproject(Vec3::new(ndc_x, ndc_y, 0.0))?;
+    let far = unproject(Vec3::new(ndc_x, ndc_y, 1.0))?;
+    let direction = (far - near).normalize_or_zero();
+    if direction == Vec3::ZERO {
+        return None;
+    }
+    Some(Ray {
+        origin: near,
+        direction,
+    })
+}
+
+/// The ray through a screen position, from a camera and a viewport.
+pub fn screen_ray_with_camera(cursor: Vec2, camera: &EditorCamera, viewport: Vec2) -> Option<Ray> {
+    let aspect = viewport.x / viewport.y.max(1.0);
+    screen_ray(cursor, camera.view_projection(aspect), viewport)
+}
+
+/// Where a ray meets an axis-aligned box, or `None` if it misses.
+///
+/// The slab method: the ray enters the box where it crosses the near face of
+/// each axis and leaves at the far face, and it hits only if every axis is
+/// crossed within the same span. A ray that misses on any one axis misses the
+/// box, which is what makes this exact rather than a per-face test that has to
+/// be right about all six.
+///
+/// Returns the *near* intersection, so a click selects the face the user can
+/// actually see rather than the far side of the box.
+pub fn ray_box_intersection(
+    origin: Vec3,
+    direction: Vec3,
+    centre: Vec3,
+    size: Vec3,
+) -> Option<f32> {
+    let half = size.abs() * 0.5;
+    let mut t_enter = f32::NEG_INFINITY;
+    let mut t_exit = f32::INFINITY;
+    for axis in 0..3 {
+        // The slab for this axis, as the two planes bounding it.
+        let (o, d) = (origin[axis], direction[axis]);
+        let (lo, hi) = (centre[axis] - half[axis], centre[axis] + half[axis]);
+        if d.abs() < 1.0e-8 {
+            // Parallel to this pair of planes: either always inside them, which
+            // contributes no constraint, or never, which misses outright.
+            if o < lo || o > hi {
+                return None;
+            }
+            continue;
+        }
+        let t0 = (lo - o) / d;
+        let t1 = (hi - o) / d;
+        // The two crossings are in whatever order the direction implies, so they
+        // are sorted rather than assumed.
+        let (near, far) = if t0 < t1 { (t0, t1) } else { (t1, t0) };
+        t_enter = t_enter.max(near);
+        t_exit = t_exit.min(far);
+        // The spans no longer overlap, so the ray has left the box before it
+        // finished entering it.
+        if t_enter > t_exit {
+            return None;
+        }
+    }
+    // The box was crossed on every axis, and the span is consistent. The one
+    // thing left is whether that span is ahead of the ray at all: a box entirely
+    // behind the origin still produces a consistent span, just a wholly negative
+    // one, and crossing its planes is not a hit if the crossing was behind us.
+    if t_exit < 0.0 {
+        return None;
+    }
+    // The near crossing, so a click selects the face the user can see. A ray
+    // starting inside the box has a negative entry, and the exit is the only
+    // surface there is to see from in there.
+    Some(if t_enter >= 0.0 { t_enter } else { t_exit })
+}
+
+/// The point a ray meets an axis-aligned box, or `None` if it misses.
+pub fn ray_hits_box(origin: Vec3, direction: Vec3, centre: Vec3, size: Vec3) -> Option<Vec3> {
+    let t = ray_box_intersection(origin, direction, centre, size)?;
+    Some(origin + direction * t)
 }
 
 /// The rotation of a gizmo, from its object's world transform.
@@ -785,5 +941,224 @@ mod tests {
     #[test]
     fn axes_have_indices_and_labels() {
         axes_have_indices();
+    }
+
+    /// A camera on the diagonal aimed at the origin, so a point in front of it
+    /// is genuinely in front rather than off to one side.
+    fn looking_at_origin() -> EditorCamera {
+        let mut c = EditorCamera::perspective();
+        c.position = Vec3::new(6.0, 5.0, 6.0);
+        c.yaw = std::f32::consts::FRAC_PI_4;
+        c.pitch = -0.6;
+        c
+    }
+
+    fn viewport() -> Vec2 {
+        Vec2::new(800.0, 600.0)
+    }
+
+    #[test]
+    fn a_ray_points_away_from_the_camera() {
+        let cam = looking_at_origin();
+        let ray = screen_ray_with_camera(Vec2::new(400.0, 300.0), &cam, viewport())
+            .expect("a ray through the middle of the viewport");
+        // The camera looks at the origin, so the ray from the middle of the
+        // screen must point back towards it. A ray pointing the other way is
+        // what an un-undone Y flip or a wrong depth convention looks like.
+        let to_origin = (Vec3::ZERO - cam.position).normalize_or_zero();
+        assert!(
+            ray.direction.dot(to_origin) > 0.9,
+            "the ray points {:?}, away from the origin at {to_origin:?}",
+            ray.direction
+        );
+    }
+
+    #[test]
+    fn a_ray_has_a_unit_direction() {
+        let cam = looking_at_origin();
+        let ray = screen_ray_with_camera(Vec2::new(120.0, 480.0), &cam, viewport()).expect("a ray");
+        assert!(
+            (ray.direction.length() - 1.0).abs() < 1.0e-4,
+            "direction length was {}",
+            ray.direction.length()
+        );
+    }
+
+    #[test]
+    fn a_ray_at_a_projected_point_passes_through_it() {
+        // The round trip that matters: project a world point, unproject the
+        // screen position, and the ray must pass through the original point.
+        // Anything less and a resize handle would drift away from the cursor.
+        let cam = looking_at_origin();
+        let vp = viewport();
+        let world = Vec3::new(0.5, -0.25, 0.0);
+        let screen = project_with_camera(world, &cam, vp).expect("the point is in front");
+        let ray = screen_ray_with_camera(screen, &cam, vp).expect("a ray");
+        // The point is on the ray if the vector from the origin to it is
+        // parallel to the direction.
+        let to_point = world - ray.origin;
+        assert!(
+            to_point.length() > 0.1,
+            "the point is on top of the camera: {world:?}"
+        );
+        let parallel = to_point.normalize_or_zero().dot(ray.direction).abs();
+        assert!(
+            parallel > 0.999,
+            "the ray misses the point it came from: dir {:?}, offset {to_point:?}",
+            ray.direction
+        );
+    }
+
+    #[test]
+    fn a_ray_through_the_centre_hits_a_box_at_the_origin() {
+        let cam = looking_at_origin();
+        let ray = screen_ray_with_camera(Vec2::new(400.0, 300.0), &cam, viewport()).expect("a ray");
+        let hit = ray_hits_box(ray.origin, ray.direction, Vec3::ZERO, Vec3::splat(1.0))
+            .expect("a box at the origin is in the middle of the view");
+        // The near face of the box, so the hit is half a unit from the centre
+        // along the ray.
+        assert!(
+            hit.distance(Vec3::ZERO) < 1.0,
+            "the hit was {hit:?}, which is past the box's near face"
+        );
+    }
+
+    #[test]
+    fn a_ray_away_from_the_viewport_misses_the_box() {
+        let cam = looking_at_origin();
+        // The top-left corner looks well off to one side of a box at the origin.
+        let ray = screen_ray_with_camera(Vec2::new(2.0, 2.0), &cam, viewport()).expect("a ray");
+        assert!(
+            ray_hits_box(ray.origin, ray.direction, Vec3::ZERO, Vec3::splat(1.0)).is_none(),
+            "a ray through the corner should miss a unit box at the origin"
+        );
+    }
+
+    #[test]
+    fn a_ray_pointing_away_from_the_box_misses_it() {
+        // The ray starts at the origin travelling +Z, and the box is at z = -10.
+        // That is behind it in the only sense that matters: the span of the
+        // crossing is wholly negative, so every plane is behind the ray.
+        //
+        // The direction is the part that is easy to get backwards. A ray at
+        // z = 20 travelling -Z *does* hit a box at z = -10, because it reaches
+        // it — the box is in front of that ray, however negative its coordinate.
+        let hit = ray_hits_box(
+            Vec3::ZERO,
+            Vec3::Z,
+            Vec3::new(0.0, 0.0, -10.0),
+            Vec3::splat(1.0),
+        );
+        assert!(hit.is_none(), "a box behind the ray was hit at {hit:?}");
+    }
+
+    #[test]
+    fn a_ray_starting_inside_a_box_reports_the_exit() {
+        // A camera inside a box is unusual but not impossible, and the slab test
+        // must not divide by zero or return nonsense. The reported point is the
+        // far face, which is the only surface there is to see from in there.
+        let hit = ray_hits_box(
+            Vec3::ZERO,
+            Vec3::Z,
+            Vec3::new(0.0, 0.0, 5.0),
+            Vec3::splat(2.0),
+        )
+        .expect("a ray starting inside a box still has an exit");
+        assert!(
+            (hit.z - 4.0).abs() < 1.0e-4,
+            "expected the far face at z=4, got {hit:?}"
+        );
+    }
+
+    #[test]
+    fn a_ray_parallel_to_a_slab_outside_it_misses_the_box() {
+        // Travelling along X at a Y and Z outside the box: the X slab never
+        // constrains, and the other two say no.
+        let hit = ray_hits_box(
+            Vec3::new(-10.0, 5.0, 5.0),
+            Vec3::X,
+            Vec3::ZERO,
+            Vec3::splat(1.0),
+        );
+        assert!(hit.is_none());
+    }
+
+    #[test]
+    fn a_ray_parallel_to_a_slab_inside_it_can_hit() {
+        // The same ray inside the box's Y and Z range does hit, on the -X face.
+        let hit = ray_hits_box(
+            Vec3::new(-10.0, 0.0, 0.0),
+            Vec3::X,
+            Vec3::ZERO,
+            Vec3::splat(2.0),
+        )
+        .expect("a ray along the box's own axis and inside it must hit");
+        assert!(
+            (hit.x + 1.0).abs() < 1.0e-4,
+            "hit the wrong face at {hit:?}"
+        );
+    }
+
+    #[test]
+    fn a_larger_box_is_hit_where_a_smaller_one_is_not() {
+        // The discriminating test for a slab test that is not actually testing
+        // all three axes: a ray that grazes a small box but passes through a
+        // large one.
+        let origin = Vec3::new(0.0, 0.0, 5.0);
+        let dir = Vec3::new(0.0, 0.0, -1.0);
+        assert!(ray_hits_box(origin, dir, Vec3::ZERO, Vec3::splat(1.0)).is_some());
+        // A box offset in X that this ray, straight down -Z at x=0, cannot reach.
+        assert!(
+            ray_hits_box(origin, dir, Vec3::new(20.0, 0.0, 0.0), Vec3::splat(1.0)).is_none(),
+            "a ray straight down -Z at x=0 hit a box centred at x=20"
+        );
+    }
+
+    #[test]
+    fn a_ray_meets_a_plane_it_points_at() {
+        let ray = Ray {
+            origin: Vec3::ZERO,
+            direction: Vec3::Z,
+        };
+        let hit = ray
+            .intersect_plane(Vec3::new(0.0, 0.0, 5.0), Vec3::Z)
+            .expect("a ray pointing at the plane meets it");
+        assert!((hit.z - 5.0).abs() < 1.0e-4, "met it at {hit:?}");
+    }
+
+    #[test]
+    fn a_ray_parallel_to_a_plane_does_not_meet_it() {
+        // The case that would otherwise divide by zero and put the handle at
+        // infinity.
+        let ray = Ray {
+            origin: Vec3::ZERO,
+            direction: Vec3::X,
+        };
+        assert!(
+            ray.intersect_plane(Vec3::new(0.0, 0.0, 5.0), Vec3::Z)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_ray_pointing_away_from_a_plane_does_not_meet_it() {
+        // Behind the ray, not in front of it: the drag has no answer, and the box
+        // should stay put rather than jump.
+        let ray = Ray {
+            origin: Vec3::ZERO,
+            direction: Vec3::NEG_Z,
+        };
+        assert!(
+            ray.intersect_plane(Vec3::new(0.0, 0.0, 5.0), Vec3::Z)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_zero_sized_viewport_produces_no_ray() {
+        // A minimised window reports a zero extent, and a ray through it would
+        // be a division by zero.
+        let cam = looking_at_origin();
+        assert!(screen_ray_with_camera(Vec2::new(10.0, 10.0), &cam, Vec2::ZERO).is_none());
     }
 }

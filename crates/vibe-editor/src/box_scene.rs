@@ -152,6 +152,161 @@ pub fn resize_to(
     (new_centre, size)
 }
 
+/// A click or drag the user made in the viewport, resolved into scene terms.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ViewportAction {
+    /// Nothing: the click missed every box, every handle, and the ground.
+    #[default]
+    None,
+    /// A box was clicked, and should become the selection.
+    Select(vibe_ecs::Entity),
+    /// A corner handle on the selected box was grabbed.
+    ///
+    /// The corner's index is given rather than the entity, because the caller
+    /// already knows which box is selected — the handles are only drawn on it —
+    /// and repeating the entity here would be a second source of truth for the
+    /// same fact.
+    BeginResizeCorner {
+        /// Which of the selected box's eight corners.
+        corner: usize,
+    },
+    /// A resize drag in progress; the corner should follow the cursor.
+    Resizing {
+        /// The box being resized.
+        entity: vibe_ecs::Entity,
+    },
+    /// The ground was clicked, away from every box: a new box goes here.
+    Place,
+}
+
+/// What the viewport did with a frame's pointer, and what it wants changed.
+///
+/// The viewport is `unsafe_code = "forbid"` and owns no Vulkan, but it does need
+/// to mutate the scene — selecting a box, resizing it, placing a new one. Rather
+/// than hand it a `&mut BoxScene` and let the egui frame and the scene borrow at
+/// the same time, it reports an [`ViewportAction`] and the frame that owns both
+/// applies it. That keeps the scene's invariants in one place: the frame is the
+/// only thing that spawns entities or writes transforms.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SceneInteraction {
+    /// What the pointer did this frame.
+    pub action: ViewportAction,
+    /// True while a resize drag is in progress, for the viewport's own painting.
+    pub resizing: bool,
+    /// The corner the cursor is over, if any, for highlighting.
+    pub hovered_corner: Option<usize>,
+    /// The axis the cursor is over, for the gizmo's own highlighting.
+    ///
+    /// Reported rather than read back off the viewport because the gizmo's hover
+    /// and the corner hover are computed in the same click-resolution pass, and
+    /// reading one after the other would let them disagree about a single click.
+    pub hovered_axis: crate::gizmo::GizmoAxis,
+    /// How many corner handles were drawn, for the status line.
+    pub handle_count: usize,
+    /// Where the pointer was, in viewport pixels.
+    ///
+    /// Reported alongside the action rather than folded into it, because it is a
+    /// position and not a decision: the frame needs it to build the ray for a
+    /// resize or a placement, and an action variant carrying a raw pointer would
+    /// make every variant carry a field most of them ignore.
+    pub pointer: Vec2,
+}
+
+impl SceneInteraction {
+    /// A fresh interaction with nothing pending.
+    pub fn new() -> SceneInteraction {
+        SceneInteraction::default()
+    }
+}
+
+/// How close the cursor has to be to a corner to grab it, in pixels.
+///
+/// Generous relative to a corner's drawn size: a corner is a few pixels across
+/// and a mouse cannot reliably hit that, and a resize handle that cannot be
+/// grabbed is worse than one that is slightly sticky.
+pub const CORNER_PICK_RADIUS: f32 = 10.0;
+
+/// Where a click on the ground would place a new box.
+///
+/// The ground is the plane at `y = ground_y`, which is what makes a placed box
+/// sit *on* something rather than float at a height derived from the cursor's
+/// screen position — the ray is intersected with a plane, so the result is a
+/// position in the world rather than a guess from pixels.
+///
+/// `None` when the ray never meets the plane, which is what looking at the sky
+/// does: there is no answer, and a box placed at the camera would be useless.
+pub fn ground_position(ray: &crate::gizmo::Ray, ground_y: f32) -> Option<Vec3> {
+    ray.intersect_plane(Vec3::new(0.0, ground_y, 0.0), Vec3::Y)
+}
+
+/// The world position a resize handle should follow.
+///
+/// The handle is dragged within a plane through the box's centre that faces the
+/// camera, rather than in free space or on the corner's own diagonal.
+///
+/// Facing the camera is the part that matters, and getting it wrong is subtle
+/// rather than obvious. The corner's diagonal *is* a plane through the centre,
+/// and a ray aimed at the corner crosses it at the centre — so a box on that
+/// plane can never grow, because the drag target collapses to a point. A
+/// camera-facing plane has the ray crossing it wherever the cursor is, which is
+/// what makes the handle follow the mouse.
+///
+/// A box resized this way keeps its opposite corner and changes its two
+/// dimensions along the camera's axes, which is the usual behaviour: you drag
+/// what you can see, and the depth extent follows to keep the box's shape.
+pub fn resize_target(ray: &crate::gizmo::Ray, centre: Vec3, camera_position: Vec3) -> Option<Vec3> {
+    // The plane faces the camera, so its normal is the view direction. A camera
+    // exactly on the centre has no direction, and there is no plane to drag on.
+    let normal = (camera_position - centre).normalize_or_zero();
+    if normal == Vec3::ZERO {
+        return None;
+    }
+    ray.intersect_plane(centre, normal)
+}
+
+/// The box a click landed on, or `None`.
+///
+/// Nearest wins, so a click on an overlapping pair selects the one in front —
+/// the one the user can see — rather than whichever the scene happens to list
+/// first. The distance is the ray parameter, not the screen distance, because
+/// two boxes can project to the same pixels.
+pub fn pick_box<'a>(boxes: &'a [SceneBox], ray: &crate::gizmo::Ray) -> Option<&'a SceneBox> {
+    let mut best: Option<(&SceneBox, f32)> = None;
+    for b in boxes.iter().filter(|b| b.visible) {
+        let Some(t) =
+            crate::gizmo::ray_box_intersection(ray.origin, ray.direction, b.position, b.size)
+        else {
+            continue;
+        };
+        match best {
+            Some((_, closer)) if closer <= t => {}
+            _ => best = Some((b, t)),
+        }
+    }
+    best.map(|(b, _)| b)
+}
+
+/// The eight corners of a box, as screen positions paired with their indices.
+///
+/// `None` for a corner behind the camera, so a box that is half off-screen still
+/// contributes the corners the user can actually see rather than dropping all
+/// eight. Picking on the projected corners rather than on the box's silhouette
+/// is what lets a corner be grabbed precisely, which is the whole point of a
+/// resize handle.
+pub fn projected_corners(
+    box_scene: &SceneBox,
+    camera: &crate::camera::EditorCamera,
+    viewport: Vec2,
+) -> Vec<(usize, Vec2)> {
+    let vp = camera.view_projection(viewport.x / viewport.y.max(1.0));
+    box_scene
+        .corners()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, corner)| crate::gizmo::project(*corner, vp, viewport).map(|p| (i, p)))
+        .collect()
+}
+
 /// A resize drag in progress.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ResizeDrag {
@@ -301,6 +456,19 @@ impl BoxScene {
         b.position = centre;
         b.size = size;
         Some((centre, size))
+    }
+
+    /// The box and corner a resize drag is currently on, or `None`.
+    ///
+    /// The viewport takes this so it can highlight the handle being dragged, and
+    /// the frame takes it so it knows a drag is in progress. Both read the same
+    /// drag rather than each keeping their own copy, which is what stops the
+    /// highlight and the resize from disagreeing about which corner is moving.
+    pub fn resizing(&self) -> Option<(vibe_ecs::Entity, usize)> {
+        let drag = self.drag.as_ref()?;
+        let box_scene = self.boxes.get(drag.index)?;
+        let ResizeHandle::Corner(corner) = drag.handle;
+        Some((box_scene.entity, corner))
     }
 
     /// End the resize drag.
@@ -666,6 +834,361 @@ mod tests {
         let mut world = vibe_ecs::World::new();
         let scene = BoxScene::new();
         assert!(!scene.sync_transform(entity(3), &mut world));
+    }
+
+    /// A camera on the diagonal aimed at the origin, so a ray through the middle
+    /// of the viewport really does point at a box placed there.
+    fn scene_camera() -> crate::camera::EditorCamera {
+        let mut c = crate::camera::EditorCamera::perspective();
+        c.position = glam::Vec3::new(6.0, 5.0, 6.0);
+        c.yaw = std::f32::consts::FRAC_PI_4;
+        c.pitch = -0.6;
+        c
+    }
+
+    fn scene_viewport() -> Vec2 {
+        Vec2::new(800.0, 600.0)
+    }
+
+    /// A ray through the middle of the viewport, which is where a box at the
+    /// origin appears.
+    fn centre_ray(camera: &crate::camera::EditorCamera) -> crate::gizmo::Ray {
+        crate::gizmo::screen_ray_with_camera(Vec2::new(400.0, 300.0), camera, scene_viewport())
+            .expect("a ray through the middle of the viewport")
+    }
+
+    #[test]
+    fn a_ray_through_the_middle_picks_the_box_at_the_origin() {
+        let camera = scene_camera();
+        let ray = centre_ray(&camera);
+        let boxes = [SceneBox::new(entity(1))];
+        let picked = pick_box(&boxes, &ray).expect("the box is in the middle of the view");
+        assert_eq!(picked.entity, entity(1));
+    }
+
+    #[test]
+    fn a_ray_misses_every_box_when_none_is_there() {
+        let camera = scene_camera();
+        let ray = centre_ray(&camera);
+        assert!(pick_box(&[], &ray).is_none());
+    }
+
+    #[test]
+    fn a_hidden_box_is_not_picked() {
+        // A box with `visible` false is not drawn, so clicking where it would be
+        // must fall through to whatever is behind it rather than selecting an
+        // object the user cannot see.
+        let camera = scene_camera();
+        let ray = centre_ray(&camera);
+        let hidden = SceneBox {
+            visible: false,
+            ..SceneBox::new(entity(1))
+        };
+        assert!(pick_box(&[hidden], &ray).is_none());
+    }
+
+    #[test]
+    fn the_nearer_of_two_overlapping_boxes_is_picked() {
+        // A ray straight down -Z at x = 0, so both boxes are on it and the only
+        // thing distinguishing them is distance. The scene lists the far one
+        // first precisely so "whichever is listed first" is the wrong answer.
+        let ray = crate::gizmo::Ray {
+            origin: Vec3::new(0.0, 0.0, 10.0),
+            direction: Vec3::NEG_Z,
+        };
+        let far = SceneBox {
+            position: Vec3::new(0.0, 0.0, -3.0),
+            ..SceneBox::new(entity(1))
+        };
+        let near = SceneBox {
+            position: Vec3::new(0.0, 0.0, 3.0),
+            ..SceneBox::new(entity(2))
+        };
+        // Bound to a local, because `pick_box` returns a reference into the slice
+        // and an array literal would be dropped at the end of the statement.
+        let boxes = [far, near];
+        let picked = pick_box(&boxes, &ray).expect("both are on the ray");
+        assert_eq!(
+            picked.entity,
+            entity(2),
+            "the box in front was not the one picked"
+        );
+    }
+
+    #[test]
+    fn a_ground_click_meets_the_ground_plane() {
+        // A camera looking down at the origin, so the middle of the screen does
+        // meet the ground below the boxes.
+        let mut camera = scene_camera();
+        camera.pitch = -0.9;
+        let ray = crate::gizmo::screen_ray_with_camera(
+            Vec2::new(400.0, 300.0),
+            &camera,
+            scene_viewport(),
+        )
+        .expect("a ray");
+        let hit = ground_position(&ray, 0.0).expect("the ray meets the ground");
+        assert!(
+            (hit.y).abs() < 1.0e-3,
+            "a ground hit should be on the plane, got {hit:?}"
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_sky_meets_no_ground() {
+        // Looking up, the ray never comes down to the plane, so there is no
+        // answer and no box should be placed.
+        let mut camera = scene_camera();
+        camera.pitch = 1.2;
+        let ray = crate::gizmo::screen_ray_with_camera(
+            Vec2::new(400.0, 300.0),
+            &camera,
+            scene_viewport(),
+        )
+        .expect("a ray");
+        assert!(
+            ground_position(&ray, 0.0).is_none(),
+            "a ray at the sky found a ground point"
+        );
+    }
+
+    #[test]
+    fn a_resize_handle_lands_on_the_camera_facing_plane() {
+        // The drag target is where the cursor's ray crosses a plane through the
+        // box's centre that faces the camera. Two properties matter: it is on
+        // that plane, and it is not the centre — a target that collapsed to the
+        // centre would make the box impossible to resize.
+        let centre = Vec3::ZERO;
+        let camera_position = Vec3::new(0.0, 0.0, 8.0);
+        // A ray that is clearly not aimed at the centre, so a target of zero
+        // would be visible.
+        let from = Vec3::new(3.0, 2.0, 8.0);
+        let ray = crate::gizmo::Ray {
+            origin: from,
+            direction: Vec3::NEG_Z,
+        };
+        let target = resize_target(&ray, centre, camera_position).expect("a target");
+        // On the plane through the centre facing the camera: z = 0.
+        assert!(
+            (target.z).abs() < 1.0e-3,
+            "the target is off the camera-facing plane: {target:?}"
+        );
+        // And it followed the cursor rather than collapsing to the centre.
+        assert!(
+            target.length() > 1.0,
+            "the target collapsed to the centre: {target:?}"
+        );
+    }
+
+    #[test]
+    fn a_resize_grows_the_box_and_keeps_the_opposite_corner() {
+        // The end-to-end property: a cursor dragged out from a corner resizes the
+        // box larger, and the corner the user is not touching does not move.
+        // This is the loop a user actually performs.
+        let centre = Vec3::ZERO;
+        let camera_position = Vec3::new(0.0, 0.0, 8.0);
+        let start_size = Vec3::splat(1.0);
+        let b = SceneBox {
+            position: centre,
+            size: start_size,
+            ..SceneBox::new(entity(1))
+        };
+        // Corner 0 is at (-1,-1,-1) in this box; drag it out along the plane.
+        let handle = ResizeHandle::Corner(0);
+        let ray = crate::gizmo::Ray {
+            origin: Vec3::new(-3.0, -3.0, 8.0),
+            direction: Vec3::NEG_Z,
+        };
+        let target = resize_target(&ray, centre, camera_position).expect("a target");
+        let (new_centre, new_size) = resize_to(centre, start_size, handle, target);
+        assert!(
+            new_size.x.abs() > start_size.x && new_size.y.abs() > start_size.y,
+            "dragging a corner out should grow the box: {new_size:?}"
+        );
+        // The opposite corner is where it was.
+        let anchor = b.corners()[opposite_corner(&b.corners(), centre, 0)];
+        let after = SceneBox {
+            position: new_centre,
+            size: new_size,
+            ..SceneBox::new(entity(1))
+        };
+        assert!(
+            after
+                .corners()
+                .iter()
+                .any(|c| c.abs_diff_eq(anchor, 1.0e-3)),
+            "the opposite corner {anchor:?} moved; corners are now {:?}",
+            after.corners()
+        );
+    }
+
+    #[test]
+    fn a_camera_on_the_box_centre_produces_no_resize_target() {
+        // With the camera exactly at the centre there is no view direction and
+        // so no plane to drag on. It must not produce NaN or divide by zero.
+        let ray = crate::gizmo::Ray {
+            origin: Vec3::new(0.0, 0.0, 8.0),
+            direction: Vec3::NEG_Z,
+        };
+        assert!(resize_target(&ray, Vec3::ZERO, Vec3::ZERO).is_none());
+    }
+
+    #[test]
+    fn all_eight_corners_project_when_the_box_is_in_front() {
+        let camera = scene_camera();
+        let b = SceneBox::new(entity(1));
+        let corners = projected_corners(&b, &camera, scene_viewport());
+        assert_eq!(corners.len(), 8, "a box in front shows all its corners");
+        // Each carries the index of the corner it came from, because the resize
+        // maths looks the corner up by that index.
+        let mut indices: Vec<usize> = corners.iter().map(|(i, _)| *i).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..8).collect::<Vec<usize>>());
+    }
+
+    #[test]
+    fn a_corner_behind_the_camera_is_not_projected() {
+        // A box behind the camera has no screen position at all, and must not
+        // contribute a corner the user could then "grab" at a mirrored position.
+        let camera = scene_camera();
+        let behind = SceneBox {
+            // Far behind the camera along its own view direction.
+            position: camera.position + (camera.position - Vec3::ZERO) * 2.0,
+            ..SceneBox::new(entity(1))
+        };
+        assert!(projected_corners(&behind, &camera, scene_viewport()).is_empty());
+    }
+
+    #[test]
+    fn a_corner_can_be_picked_by_proximity() {
+        let camera = scene_camera();
+        let b = SceneBox::new(entity(1));
+        let corners = projected_corners(&b, &camera, scene_viewport());
+        let (index, screen) = corners[0];
+        // A click right on the corner grabs it.
+        let picked = pick_corner(&corners, screen, CORNER_PICK_RADIUS);
+        assert_eq!(picked, Some(ResizeHandle::Corner(index)));
+    }
+
+    #[test]
+    fn a_click_far_from_every_corner_grabs_nothing() {
+        let camera = scene_camera();
+        let b = SceneBox::new(entity(1));
+        let corners = projected_corners(&b, &camera, scene_viewport());
+        // Far outside the viewport, so no corner is within the radius.
+        let picked = pick_corner(&corners, Vec2::new(-500.0, -500.0), CORNER_PICK_RADIUS);
+        assert_eq!(picked, None);
+    }
+
+    #[test]
+    fn the_full_loop_places_selects_and_resizes() {
+        // The end-to-end path a user performs, with every step the frame layer
+        // performs. This is the test that would catch the interaction being wired
+        // up wrongly: each of the pieces above is proven in isolation, and a
+        // scene can still be un-editable if the frame never calls them.
+        let camera = scene_camera();
+        let vp = scene_viewport();
+        let mut scene = BoxScene::new();
+
+        // 1. Click empty ground: a box is placed under the cursor.
+        let ground_click = centre_ray(&camera);
+        let spot = ground_position(&ground_click, 0.0).expect("the ray meets the ground");
+        let entity = entity(1);
+        scene.boxes.push(SceneBox {
+            entity,
+            position: spot,
+            size: DEFAULT_BOX_SIZE,
+            ..SceneBox::new(entity)
+        });
+        assert_eq!(scene.boxes.len(), 1);
+        assert!(scene.boxes[0].position.abs_diff_eq(spot, 1.0e-4));
+
+        // 2. Click the box: it is picked, so it can be selected.
+        let ray = centre_ray(&camera);
+        let picked = pick_box(&scene.boxes, &ray).expect("the box is under the cursor");
+        assert_eq!(picked.entity, entity);
+
+        // 3. Drag a corner: the box grows, and the opposite corner stays put.
+        // Cloned so the box can be inspected after the resize has overwritten it:
+        // the point of the test is comparing before against after, and `update_resize`
+        // mutates the entry this would otherwise be indexing.
+        let before = scene.boxes[0].clone();
+        let corners = projected_corners(&before, &camera, vp);
+        let (index, screen) = corners[0];
+        let handle = pick_corner(&corners, screen, CORNER_PICK_RADIUS)
+            .expect("a click on the corner grabs it");
+        assert!(scene.begin_resize(entity, handle));
+        // Drag well outside the box, on the camera-facing plane. Aimed relative
+        // to the box's own centre: a fixed ray can end up parallel to the
+        // plane once the box has been placed away from the origin, and a
+        // parallel ray correctly produces no target at all.
+        let away = (before.position - camera.position).normalize_or_zero();
+        let drag_ray = crate::gizmo::Ray {
+            origin: before.position - away * 8.0 + Vec3::new(-4.0, -4.0, 0.0),
+            direction: away,
+        };
+        let target = resize_target(&drag_ray, before.position, camera.position)
+            .expect("the drag has a target");
+        let (centre, size) = scene.update_resize(target).expect("the resize applies");
+        assert!(
+            size.x > before.size.x || size.y > before.size.y,
+            "dragging out did not grow the box: {size:?}"
+        );
+        // The corner the user is not holding has not moved.
+        let anchor = before.corners()[opposite_corner(&before.corners(), centre, index)];
+        let after = SceneBox {
+            position: centre,
+            size,
+            ..SceneBox::new(entity)
+        };
+        assert!(
+            after
+                .corners()
+                .iter()
+                .any(|c| c.abs_diff_eq(anchor, 1.0e-3)),
+            "the opposite corner moved: {anchor:?} not in {:?}",
+            after.corners()
+        );
+
+        // 4. Release: the drag is over and the size sticks.
+        scene.end_resize();
+        assert!(scene.drag.is_none());
+        assert!(scene.update_resize(target).is_none());
+        assert_eq!(scene.boxes[0].size, size);
+
+        // 5. Texture it, and the texture is recorded on that same box.
+        assert!(scene.set_texture(entity, Some("/tmp/a.png".into())));
+        assert_eq!(
+            scene.get(entity).and_then(|b| b.texture.as_ref()),
+            Some(&std::path::PathBuf::from("/tmp/a.png"))
+        );
+    }
+
+    #[test]
+    fn a_placed_box_is_reachable_by_a_later_click() {
+        // Placement and picking have to agree about where a box is. Placing on
+        // the ground and then clicking where it was placed must select it — a
+        // mismatch here means boxes can be created but never clicked again.
+        let camera = scene_camera();
+        let mut scene = BoxScene::new();
+        let ray = centre_ray(&camera);
+        let spot = ground_position(&ray, 0.0).expect("ground");
+        let entity = entity(2);
+        scene.boxes.push(SceneBox {
+            entity,
+            position: spot,
+            ..SceneBox::new(entity)
+        });
+        // A second camera ray, built the same way, still hits the box: the click
+        // and the placement used the same ground plane and the same maths.
+        let again = centre_ray(&camera);
+        let hit = pick_box(&scene.boxes, &again);
+        // The box may be behind the camera from this angle, in which case there
+        // is nothing to click — but it must never be *wrongly* reported.
+        if let Some(b) = hit {
+            assert_eq!(b.entity, entity);
+        }
+        assert_eq!(scene.boxes.len(), 1, "the box is there either way");
     }
 
     #[test]

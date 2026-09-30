@@ -1,0 +1,25 @@
+[package]
+name = "vibe-editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The vibeEngine editor: an egui frontend, panels and camera controllers"
+
+[dependencies]
+egui = "0.36"
+egui-winit = "0.36"
+glam.workspace = true
+log.workspace = true
+thiserror.workspace = true
+vibe-audio.workspace = true
+vibe-ecs.workspace = true
+vibe-gltf.workspace = true
+vibe-math.workspace = true
+vibe-render.workspace = true
+vibe-rhi.workspace = true
+vibe-scene.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

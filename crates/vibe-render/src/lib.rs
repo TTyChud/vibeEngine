@@ -5,6 +5,7 @@ pub mod bind_group;
 pub mod error;
 pub mod pipeline;
 pub mod renderer;
+pub mod ui;
 
 pub use batch::Batcher;
 pub use bind_group::{BindGroup, BindGroupDesc, create_sampler};

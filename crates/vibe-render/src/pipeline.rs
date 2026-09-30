@@ -382,7 +382,14 @@ pub unsafe fn build_quad_pipeline<C: ShaderCompiler>(
     }
 }
 
-fn create_module(device: &ash::Device, words: &[u32]) -> Result<vk::ShaderModule, RenderError> {
+/// Create a shader module from compiled SPIR-V.
+///
+/// Shared with the UI pipeline, which compiles its own module and needs the
+/// same creation and error handling.
+pub(crate) fn create_module(
+    device: &ash::Device,
+    words: &[u32],
+) -> Result<vk::ShaderModule, RenderError> {
     let info = vk::ShaderModuleCreateInfo {
         code_size: words.len() * 4,
         p_code: words.as_ptr(),

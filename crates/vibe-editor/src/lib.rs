@@ -12,6 +12,8 @@
 
 pub mod camera;
 pub mod content;
+pub mod frame;
+pub mod gizmo;
 pub mod hierarchy;
 pub mod inspector;
 pub mod logs;
@@ -20,6 +22,8 @@ pub mod ui_bridge;
 
 pub use camera::{Camera2DController, CameraInput, EditorCamera};
 pub use content::{ContentBrowser, ContentEntry, ContentKind};
+pub use frame::{EditorFrame, Panel};
+pub use gizmo::{GizmoAxis, GizmoDrag};
 pub use hierarchy::{HierarchyPanel, Selection};
 pub use inspector::{FieldEdit, FieldValue, InspectorPanel};
 pub use logs::{LogLevel, LogPanel, LogSink};

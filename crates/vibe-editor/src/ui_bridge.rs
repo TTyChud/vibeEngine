@@ -11,7 +11,7 @@
 //! that has to be re-triangulated — whereas the GPU already has a scissor
 //! rectangle, and the UI pipeline declares one dynamic precisely for this.
 
-use egui::epaint::{ClippedShape, Mesh, Shape, Vertex};
+use egui::epaint::{ClippedPrimitive, Mesh, Primitive, Vertex};
 
 use vibe_render::ui::{MAX_UI_VERTICES, UiVertex};
 
@@ -68,27 +68,35 @@ impl UiDrawData {
         MAX_UI_VERTICES
     }
 
-    /// Flatten egui's output into batches.
-    pub fn from_clipped(output: &egui::FullOutput) -> UiDrawData {
-        Self::from_shapes(&output.shapes)
+    /// Tessellate egui's output and flatten it into batches.
+    ///
+    /// The tessellation step is not optional. `FullOutput::shapes` holds the
+    /// *description* of what to paint — rectangles, text runs, paths — and only
+    /// `Context::tessellate` turns those into triangles. Reading `shapes`
+    /// directly and looking for meshes finds nothing, because a frame of egui
+    /// emits almost no `Shape::Mesh` at all: the shapes are rectangles and
+    /// glyphs, and the meshes come out the far end of the tessellator.
+    pub fn from_output(context: &egui::Context, output: &egui::FullOutput) -> UiDrawData {
+        let primitives = context.tessellate(output.shapes.clone(), output.pixels_per_point);
+        Self::from_primitives(&primitives)
     }
 
-    /// Flatten a list of clipped shapes.
+    /// Flatten tessellated primitives into batches.
     ///
-    /// Consecutive meshes under one clip rectangle share a batch: a panel is
-    /// usually several meshes under a single scissor, and one vertex range per
-    /// panel rather than per mesh is what keeps the draw count at "one per
-    /// visible panel" instead of "one per widget".
-    pub fn from_shapes(shapes: &[ClippedShape]) -> UiDrawData {
+    /// Consecutive primitives under one clip rectangle share a batch: a panel is
+    /// usually several primitives under a single scissor, and one vertex range
+    /// per panel rather than per primitive is what keeps the draw count at "one
+    /// per visible panel" instead of "one per widget".
+    pub fn from_primitives(primitives: &[ClippedPrimitive]) -> UiDrawData {
         let mut data = UiDrawData::default();
         let mut budget = MAX_UI_VERTICES;
         let mut current: Option<UiBatch> = None;
 
-        for shape in shapes {
-            let Shape::Mesh(mesh) = &shape.shape else {
+        for primitive in primitives {
+            let Primitive::Mesh(mesh) = &primitive.primitive else {
                 continue;
             };
-            let clip = clip_bounds(shape);
+            let clip = clip_bounds(primitive);
             if !clip_is_visible(clip) {
                 data.clipped += 1;
                 continue;
@@ -123,9 +131,9 @@ impl UiDrawData {
     }
 }
 
-/// The clip rectangle of a shape, as `(min_x, min_y, max_x, max_y)`.
-fn clip_bounds(shape: &ClippedShape) -> (f32, f32, f32, f32) {
-    let r = shape.clip_rect;
+/// The clip rectangle of a primitive, as `(min_x, min_y, max_x, max_y)`.
+fn clip_bounds(primitive: &ClippedPrimitive) -> (f32, f32, f32, f32) {
+    let r = primitive.clip_rect;
     (r.min.x, r.min.y, r.max.x, r.max.y)
 }
 
@@ -229,10 +237,10 @@ mod tests {
         }
     }
 
-    fn clipped(clip: Rect, mesh: Mesh) -> ClippedShape {
-        ClippedShape {
+    fn clipped(clip: Rect, mesh: Mesh) -> ClippedPrimitive {
+        ClippedPrimitive {
             clip_rect: clip,
-            shape: Shape::Mesh(std::sync::Arc::new(mesh)),
+            primitive: Primitive::Mesh(mesh),
         }
     }
 
@@ -249,14 +257,14 @@ mod tests {
 
     #[test]
     fn no_shapes_is_no_geometry() {
-        let d = UiDrawData::from_shapes(&[]);
+        let d = UiDrawData::from_primitives(&[]);
         assert!(d.is_empty());
         assert_eq!(d.len(), 0);
     }
 
     #[test]
     fn a_mesh_becomes_triangles() {
-        let d = UiDrawData::from_shapes(&[clipped(full_screen(), triangle())]);
+        let d = UiDrawData::from_primitives(&[clipped(full_screen(), triangle())]);
         assert_eq!(d.len(), 3);
         assert!(!d.is_empty());
     }
@@ -268,14 +276,14 @@ mod tests {
             (0..4).map(|i| vertex(i as f32, 0.0)).collect(),
         );
         assert_eq!(
-            UiDrawData::from_shapes(&[clipped(full_screen(), mesh)]).len(),
+            UiDrawData::from_primitives(&[clipped(full_screen(), mesh)]).len(),
             6
         );
     }
 
     #[test]
     fn meshes_under_one_clip_share_a_batch() {
-        let d = UiDrawData::from_shapes(&[
+        let d = UiDrawData::from_primitives(&[
             clipped(full_screen(), triangle()),
             clipped(full_screen(), triangle()),
         ]);
@@ -286,7 +294,7 @@ mod tests {
     #[test]
     fn different_clips_make_different_batches() {
         let other = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(400.0, 1080.0));
-        let d = UiDrawData::from_shapes(&[
+        let d = UiDrawData::from_primitives(&[
             clipped(full_screen(), triangle()),
             clipped(other, triangle()),
         ]);
@@ -296,7 +304,7 @@ mod tests {
     #[test]
     fn a_batch_carries_its_clip() {
         let other = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(400.0, 1080.0));
-        let d = UiDrawData::from_shapes(&[clipped(other, triangle())]);
+        let d = UiDrawData::from_primitives(&[clipped(other, triangle())]);
         assert_eq!(d.batches[0].clip, (10.0, 20.0, 400.0, 1080.0));
     }
 
@@ -342,7 +350,7 @@ mod tests {
     #[test]
     fn a_clip_entirely_off_screen_is_dropped() {
         let off = Rect::from_min_max(Pos2::new(-5000.0, -5000.0), Pos2::new(-4000.0, -4000.0));
-        let d = UiDrawData::from_shapes(&[clipped(off, triangle())]);
+        let d = UiDrawData::from_primitives(&[clipped(off, triangle())]);
         assert!(d.is_empty());
         assert_eq!(d.clipped, 1);
     }
@@ -350,13 +358,13 @@ mod tests {
     #[test]
     fn a_non_finite_clip_is_kept_rather_than_dropped() {
         let bad = Rect::from_min_max(Pos2::new(f32::NAN, 0.0), Pos2::new(100.0, 100.0));
-        let d = UiDrawData::from_shapes(&[clipped(bad, triangle())]);
+        let d = UiDrawData::from_primitives(&[clipped(bad, triangle())]);
         assert!(!d.is_empty(), "a malformed frame must not blank the editor");
     }
 
     #[test]
     fn the_byte_length_matches_the_vertex_count() {
-        let d = UiDrawData::from_shapes(&[clipped(full_screen(), triangle())]);
+        let d = UiDrawData::from_primitives(&[clipped(full_screen(), triangle())]);
         assert_eq!(d.byte_len(), d.len() * std::mem::size_of::<UiVertex>());
     }
 

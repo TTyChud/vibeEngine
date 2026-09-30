@@ -267,7 +267,31 @@ in behind it.
   written by a newer build still loads in an older one minus the parts it does
   not know.
 
-## Milestone 6 — Audio
+## Milestone 6 — Audio (DONE, `vibe-audio`)
+
+Backed by **cpal 0.18**, not miniaudio. The `miniaudio` crate 0.10 does not
+build on this machine: its bundled bindgen 0.54 panics parsing the system
+glibc headers (`__atomic_wide_counter_struct_` is not a valid identifier).
+cpal is pure Rust over ALSA/PulseAudio and provides the same placement surface.
+Verified on this box: 26 output devices through ALSA, default device opens,
+and a mixed block peaks at 0.15 rather than silence.
+
+- 2D and 3D positional playback: distance attenuation, stereo panning, doppler
+- A movable listener with position, forward and up, and a master volume
+- Per-voice volume, playback rate, and spatial on/off
+- Once, loop and ping-pong playback
+- A mixer owning the output device, summing voices per block, retiring finished
+  one-shots, and callable by hand for headless verification
+
+Three bugs the tests caught while writing it:
+
+1. **Voices overwrote instead of summed.** The block is zeroed by the mixer and
+   each voice adds into it; assigning clobbered every voice but the last.
+2. **Master volume did not reach 2D sounds.** The non-spatial branch returned a
+   gain of 1.0, ignoring the listener volume entirely.
+3. **The pan law attenuated a centred source.** A true equal-power law divides
+   the centre by sqrt(2), which audibly dips as a source passes the listener.
+   Replaced with a unity-at-centre law.
 
 - `miniaudio` backend
 - 2D and 3D positional playback

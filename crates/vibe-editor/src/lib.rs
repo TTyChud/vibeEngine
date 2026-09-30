@@ -19,6 +19,7 @@ pub mod inspector;
 pub mod logs;
 pub mod session;
 pub mod ui_bridge;
+pub mod viewport;
 
 pub use camera::{Camera2DController, CameraInput, EditorCamera};
 pub use content::{ContentBrowser, ContentEntry, ContentKind};
@@ -30,3 +31,4 @@ pub use logs::{LogLevel, LogPanel, LogSink};
 pub use session::{EditorMode, EditorSession, FileAction, SessionError};
 pub use ui_bridge::UiDrawData;
 pub use vibe_render::ui::UiVertex;
+pub use viewport::Viewport;

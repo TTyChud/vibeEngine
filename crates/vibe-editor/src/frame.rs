@@ -81,9 +81,13 @@ pub struct EditorFrame<'a> {
     /// Which panel is open.
     pub panel: Panel,
     /// The window's size in points.
-    pub viewport: egui::Vec2,
+    pub window_size: egui::Vec2,
     /// The scene, for the hierarchy and inspector to read.
     pub world: &'a mut vibe_ecs::World,
+    /// The scene area, with the gizmo over it.
+    pub scene_viewport: &'a mut crate::viewport::Viewport,
+    /// The camera the viewport is seen through.
+    pub camera: &'a crate::camera::EditorCamera,
     /// A path the host wants opened, consumed on the next frame's Open.
     ///
     /// The file dialog belongs to the platform, so the host resolves the path
@@ -114,6 +118,7 @@ impl EditorFrame<'_> {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.draw_menu_bar(ui);
                 self.draw_panels(ui);
+                self.draw_viewport(ui);
             }));
         });
         let data = UiDrawData::from_output(self.context, &output);
@@ -260,6 +265,27 @@ impl EditorFrame<'_> {
                 ui.label("Read-only while playing");
             }
         }
+    }
+
+    /// The scene area, with the gizmo over it.
+    ///
+    /// Drawn as a central panel so it fills whatever the side panel leaves, and
+    /// so the gizmo's shapes go out in the same batches as everything else: the
+    /// viewport is not a separate render pass, it is a rect that happens to be
+    /// empty apart from the gizmo.
+    fn draw_viewport(&mut self, ui: &mut egui::Ui) {
+        // The gizmo sits on the selected entity, so an entity with no transform
+        // leaves it where it was rather than snapping it to the origin.
+        if let Some(entity) = self.session.selection
+            && let Some(t) = self.world.get::<vibe_ecs::components::Transform>(entity)
+        {
+            self.scene_viewport.follow(t.translation(), t.matrix());
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(egui::Color32::from_rgb(24, 26, 31)))
+            .show(ui, |ui| {
+                self.scene_viewport.show(ui, self.camera);
+            });
     }
 
     /// Load a scene from disk into the world.
@@ -413,6 +439,10 @@ pub struct Editor {
     pub world: vibe_ecs::World,
     /// Which panel is open.
     pub panel: Panel,
+    /// The scene area, with the transform gizmo over it.
+    pub viewport: crate::viewport::Viewport,
+    /// The floating-entity camera the viewport is seen through.
+    pub camera: crate::camera::EditorCamera,
     /// A path the host wants opened, consumed on the next frame.
     pub requested_path: Option<std::path::PathBuf>,
     /// How many frames have been drawn, for the status line.
@@ -451,6 +481,8 @@ impl Editor {
             content: ContentBrowser::new(),
             world: vibe_ecs::World::new(),
             panel: Panel::Hierarchy,
+            viewport: crate::viewport::Viewport::new(),
+            camera: crate::camera::EditorCamera::perspective(),
             requested_path: None,
             frame_count: 0,
         }
@@ -466,17 +498,19 @@ impl Editor {
             log_panel: &mut self.log_panel,
             content: &mut self.content,
             panel: self.panel,
-            viewport: egui::Vec2::ZERO,
+            window_size: egui::Vec2::ZERO,
             world: &mut self.world,
+            scene_viewport: &mut self.viewport,
+            camera: &self.camera,
             requested_path: &mut self.requested_path,
         }
     }
 
     /// Draw one frame from the input the platform layer gathered.
-    pub fn draw(&mut self, input: egui::RawInput, viewport: egui::Vec2) -> UiDrawData {
+    pub fn draw(&mut self, input: egui::RawInput, window_size: egui::Vec2) -> UiDrawData {
         self.frame_count += 1;
         let mut frame = self.frame();
-        frame.viewport = viewport;
+        frame.window_size = window_size;
         frame.draw(input)
     }
 
@@ -584,6 +618,8 @@ mod tests {
             log_panel: LogPanel::new(),
             content: ContentBrowser::new(),
             world: vibe_ecs::World::new(),
+            scene_viewport: crate::viewport::Viewport::new(),
+            camera: crate::camera::EditorCamera::perspective(),
             requested_path: None,
         }
     }
@@ -596,6 +632,8 @@ mod tests {
         log_panel: LogPanel,
         content: ContentBrowser,
         world: vibe_ecs::World,
+        scene_viewport: crate::viewport::Viewport,
+        camera: crate::camera::EditorCamera,
         requested_path: Option<std::path::PathBuf>,
     }
 
@@ -609,7 +647,9 @@ mod tests {
                 log_panel: &mut self.log_panel,
                 content: &mut self.content,
                 panel,
-                viewport: egui::Vec2::new(1280.0, 720.0),
+                window_size: egui::Vec2::new(1280.0, 720.0),
+                scene_viewport: &mut self.scene_viewport,
+                camera: &self.camera,
                 world: &mut self.world,
                 requested_path: &mut self.requested_path,
             }

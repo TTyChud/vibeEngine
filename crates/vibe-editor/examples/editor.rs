@@ -120,9 +120,19 @@ impl App {
         }
         editor.content.root = std::env::temp_dir();
         editor.content.rescan();
-        // The log is the one panel with something to say before a scene is
-        // opened, so the window is not a grid of empty boxes on first run.
-        editor.panel = Panel::Log;
+        // The hierarchy is the panel worth opening first: it is where the
+        // scene's contents are, and clicking a row there moves the gizmo.
+        editor.panel = Panel::Hierarchy;
+        // A camera on the diagonal aimed at the origin, so the gizmo's handles
+        // are all on screen rather than one pointing straight at it.
+        editor.camera.position = glam::Vec3::new(6.0, 5.0, 6.0);
+        editor.camera.yaw = std::f32::consts::FRAC_PI_4;
+        editor.camera.pitch = -0.55;
+        // Selecting the first entity puts the gizmo on it from the first frame.
+        if let Some(first) = editor.world.entities().next() {
+            editor.hierarchy.select(first);
+            editor.session.selection = Some(first);
+        }
         App {
             editor,
             _messenger: None,
@@ -158,14 +168,19 @@ impl App {
 
         if self.frames == 1 || self.frames % 120 == 0 {
             println!(
-                "[frame {}] egui: {} batch(es), {} vertex(es) -> {} byte(s)",
+                "[frame {}] egui: {} batch(es), {} vertex(es) -> {} byte(s); \
+                 gizmo {} handle(s)",
                 self.frames,
                 data.batch_count(),
                 data.len(),
-                data.byte_len()
+                data.byte_len(),
+                self.editor.viewport.handle_count,
             );
         }
 
+        // Once only. A swapchain image belongs to the presentation engine
+        // between the present and the next acquire, so copying it every frame
+        // races the compositor rather than merely costing a pipeline stall.
         let readback = !self.readback_done;
         self.readback_done = true;
         let Some(gpu) = self.gpu.as_mut() else {
@@ -417,22 +432,20 @@ impl App {
         // this the loop stalls after frames_in_flight submissions.
         gpu.resources.on_complete();
 
+        let _ = gpu
+            .swapchain
+            .present(&gpu.swapchain_loader, queue, index, present_sem);
+
         if readback {
-            // One readback, not one per frame: it proves the first frame drew
-            // and costs a full pipeline stall every time after.
+            // After the present, because that is when the image is in
+            // PRESENT_SRC_KHR. Reading it beforehand declares a source layout it
+            // is not in, which is a validation error rather than a wrong pixel.
             let lit = read_back(device, &gpu.sync2, &gpu.logical, queue, target_image, w, h);
             println!(
                 "[readback] {lit} of {} pixel(s) differ from the clear",
                 w as u64 * h as u64
             );
-            if lit == 0 {
-                eprintln!("WARNING: the frame is one flat colour, so nothing drew");
-            }
         }
-
-        let _ = gpu
-            .swapchain
-            .present(&gpu.swapchain_loader, queue, index, present_sem);
     }
 
     /// Rebuild the swapchain after a resize.

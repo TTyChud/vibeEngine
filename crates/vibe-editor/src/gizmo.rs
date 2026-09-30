@@ -142,11 +142,17 @@ pub fn project_handles(
     // What is actually needed is the world length whose *projected* length is
     // pixel_length. Measuring that directly, rather than deriving it, keeps the
     // constant honest if the camera's fov or aspect ever changes.
-    let world_length = world_length_for_pixels(&vp, origin, viewport, pixel_length);
+    //
+    // Measured per axis, and that is the part that is easy to get wrong: a
+    // handle pointing at the camera is foreshortened by perspective, so the
+    // world length that projects to 80 pixels along X is a different one along
+    // Z. Reusing X's length for all three draws the near-axis handle long and
+    // the far-axis one short, which looks like the gizmo is sheared.
     GizmoAxis::singles()
         .into_iter()
         .filter_map(|axis| {
             let dir = axis.direction()?;
+            let world_length = world_length_for_pixels(&vp, origin, viewport, pixel_length, dir);
             let tip_world = origin + dir * world_length;
             let tip = project(tip_world, vp, viewport)?;
             Some(ProjectedHandle {
@@ -165,19 +171,23 @@ pub fn project_handles(
 /// The world-space length whose projected length is about `pixels`.
 ///
 /// Found by measuring rather than derived. The projection's scale depends on
-/// the field of view, the aspect and the distance, and a formula that gets one
-/// of them wrong produces a handle that is the right length at one distance and
-/// thousands of pixels long at another — which is exactly the bug this
+/// the field of view, the aspect, the distance and the direction, and a formula
+/// that gets one of them wrong produces a handle that is the right length in
+/// one direction and wildly wrong in another — which is exactly the bug this
 /// replaces. A bisection on the measured length cannot be wrong that way.
+///
+/// `direction` must be a unit vector: the handle is measured along it, so a
+/// scaled direction would return a length scaled with it.
 pub fn world_length_for_pixels(
     view_projection: &Mat4,
     origin: Vec3,
     viewport: Vec2,
     pixels: f32,
+    direction: Vec3,
 ) -> f32 {
     let measure = |len: f32| -> Option<f32> {
         let o = project(origin, *view_projection, viewport)?;
-        let tip = project(origin + Vec3::X * len, *view_projection, viewport)?;
+        let tip = project(origin + direction * len, *view_projection, viewport)?;
         Some(tip.distance(o))
     };
     if pixels <= 0.0 || measure(0.0).is_none() {

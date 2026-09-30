@@ -11,7 +11,7 @@
 //! that has to be re-triangulated — whereas the GPU already has a scissor
 //! rectangle, and the UI pipeline declares one dynamic precisely for this.
 
-use egui::epaint::{ClippedShape, Mesh, Shape, Vertex, emath::Pos2};
+use egui::epaint::{ClippedShape, Mesh, Shape, Vertex};
 
 use vibe_render::ui::{MAX_UI_VERTICES, UiVertex};
 
@@ -208,7 +208,10 @@ fn vertex_from(v: &Vertex) -> UiVertex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui::epaint::{TextureId, emath::Rect};
+    use egui::epaint::{
+        TextureId,
+        emath::{Pos2, Rect},
+    };
 
     fn vertex(x: f32, y: f32) -> Vertex {
         Vertex {

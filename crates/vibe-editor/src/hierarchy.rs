@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use vibe_ecs::{Entity, World, components::Transform};
+use vibe_ecs::{Entity, World};
 
 /// Which entity the inspector is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -301,16 +301,13 @@ pub fn named_label(world: &World, entity: Entity) -> String {
 mod tests {
     use super::*;
     use vibe_ecs::components::Tag;
+    use vibe_ecs::components::Transform;
 
     fn world_with_roots() -> World {
         let mut w = World::new();
         w.spawn();
         w.spawn();
         w
-    }
-
-    fn handle(index: u32) -> Entity {
-        Entity::from_parts(index, 1)
     }
 
     #[test]

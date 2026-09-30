@@ -1242,10 +1242,31 @@ mod tests {
     }
 
     #[test]
-    fn an_encode_produces_finite_bytes() {
-        for d in [-1.0, -0.1, 0.0, 0.1, 1.0] {
-            assert!(encode_distance(d).iter().all(|v| *v <= 255));
+    fn an_encode_is_monotonic_in_the_distance() {
+        // A larger distance must never encode to a smaller byte, or the field
+        // would invert halfway through a glyph's interior.
+        let mut previous = 0u8;
+        for step in 0..=20 {
+            let d = -1.0 + step as f32 * 0.1;
+            let encoded = encode_distance(d)[0];
+            assert!(
+                encoded >= previous,
+                "not monotonic at {d}: {previous} then {encoded}"
+            );
+            previous = encoded;
         }
+    }
+
+    #[test]
+    fn an_encode_uses_the_whole_byte_range() {
+        let low = encode_distance(-10.0)[0];
+        let high = encode_distance(10.0)[0];
+        assert_eq!(low, 0);
+        assert_eq!(high, 255);
+        assert!(
+            high > low,
+            "a field that never spans the range cannot be interpolated"
+        );
     }
 
     /// A real font on this machine, or `None` when there is none.

@@ -763,8 +763,6 @@ fn renderer_camera_matrix(width: f32, height: f32) -> glam::Mat4 {
 struct Verdict {
     /// The colour found at each sample point, as BGR.
     samples: Vec<[u8; 3]>,
-    /// The label each sample was expected to be.
-    expected: Vec<&'static str>,
     /// How many samples matched their expected colour.
     matched: usize,
 }
@@ -951,7 +949,6 @@ fn read_back(
     // primaries survive that round trip, so an exact compare is safe here.
     let wanted: [[u8; 3]; 4] = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
     let mut samples = Vec::with_capacity(points.len());
-    let mut expected = Vec::with_capacity(points.len());
     let mut matched = 0;
     for (i, (x, y, label)) in points.iter().enumerate() {
         let got = px(*x, *y);
@@ -965,11 +962,6 @@ fn read_back(
             if ok { "ok" } else { "MISMATCH" }
         );
         samples.push(got);
-        expected.push(*label);
     }
-    Some(Verdict {
-        samples,
-        expected,
-        matched,
-    })
+    Some(Verdict { samples, matched })
 }

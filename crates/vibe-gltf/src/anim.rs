@@ -770,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn paths_round_trip_through_their_glTF_names() {
+    fn paths_round_trip_through_their_gl_tf_names() {
         for p in [
             ChannelPath::Translation,
             ChannelPath::Rotation,

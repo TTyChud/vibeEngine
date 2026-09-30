@@ -1,122 +1,203 @@
 //! Turning egui's clipped output into triangles the engine can draw.
 //!
-//! egui hands back a list of `ClippedPrimitive`s, each a mesh plus a clip
-//! rectangle. Flattening that into one vertex list is the whole job, and the
-//! clip rectangle is why it is not free: a primitive scissored to part of the
-//! window has to be either clipped geometrically or drawn with a scissor, and
-//! this engine's UI pipeline has no per-draw scissor, so the vertices themselves
-//! are moved and dropped.
+//! egui hands back a list of `ClippedShape`s: each a mesh plus the rectangle it
+//! was drawn into. Both halves matter. The mesh is already a triangle list, so
+//! the conversion is mechanical; the clip rectangle is what keeps a panel's
+//! contents inside the panel, and dropping it draws a scrolled list straight
+//! over the viewport behind it.
+//!
+//! The clip is kept as data rather than applied to the vertices. Clipping
+//! triangles in software is fiddly and lossy — a clipped quad becomes a polygon
+//! that has to be re-triangulated — whereas the GPU already has a scissor
+//! rectangle, and the UI pipeline declares one dynamic precisely for this.
 
-pub use egui::epaint::emath::Pos2;
-use egui::epaint::{ClippedShape, Mesh, TextureId, Vertex, fonts::FontsDelta};
+use egui::epaint::{ClippedShape, Mesh, Shape, Vertex, emath::Pos2};
 
 use vibe_render::ui::{MAX_UI_VERTICES, UiVertex};
+
+/// One mesh's triangles and the rectangle they are clipped to.
+#[derive(Debug, Clone, Default)]
+pub struct UiBatch {
+    /// The triangles, as the UI pipeline's vertex.
+    pub vertices: Vec<UiVertex>,
+    /// The clip rectangle as `(min_x, min_y, max_x, max_y)`, in pixels.
+    pub clip: (f32, f32, f32, f32),
+}
+
+impl UiBatch {
+    /// True when the batch has nothing to draw.
+    pub fn is_empty(&self) -> bool {
+        self.vertices.is_empty()
+    }
+}
 
 /// One frame's UI geometry, ready to upload.
 #[derive(Debug, Clone, Default)]
 pub struct UiDrawData {
-    /// The triangles, as the UI pipeline's vertex.
-    pub vertices: Vec<UiVertex>,
-    /// How many primitives were clipped away entirely.
+    /// The batches, in draw order.
+    pub batches: Vec<UiBatch>,
+    /// How many shapes were skipped entirely.
     pub clipped: usize,
+    /// How many triangles were skipped for exceeding the vertex cap.
+    pub dropped: usize,
 }
 
 impl UiDrawData {
     /// Nothing to draw.
     pub fn is_empty(&self) -> bool {
-        self.vertices.is_empty()
+        self.batches.iter().all(|b| b.is_empty())
     }
 
-    /// How many vertices are queued.
+    /// How many vertices are queued across every batch.
     pub fn len(&self) -> usize {
-        self.vertices.len()
+        self.batches.iter().map(|b| b.vertices.len()).sum()
+    }
+
+    /// How many batches are queued.
+    pub fn batch_count(&self) -> usize {
+        self.batches.len()
     }
 
     /// Bytes the queued vertices occupy on the GPU.
     pub fn byte_len(&self) -> usize {
-        self.vertices.len() * std::mem::size_of::<UiVertex>()
+        self.len() * std::mem::size_of::<UiVertex>()
     }
 
-    /// The vertex limit, exposed so the renderer can size its buffer.
+    /// The vertex cap, exposed so the renderer can size its buffer.
     pub fn capacity() -> usize {
         MAX_UI_VERTICES
     }
 
-    /// Flatten egui's output into one vertex list.
+    /// Flatten egui's output into batches.
     pub fn from_clipped(output: &egui::FullOutput) -> UiDrawData {
-        Self::from_primitives(&output.shapes, &output.textures_delta)
+        Self::from_shapes(&output.shapes)
     }
 
-    /// Flatten a list of shapes, clipping each to its own rectangle.
-    pub fn from_primitives(shapes: &[egui::Shape], textures: &TexturesDelta) -> UiDrawData {
+    /// Flatten a list of clipped shapes.
+    ///
+    /// Consecutive meshes under one clip rectangle share a batch: a panel is
+    /// usually several meshes under a single scissor, and one vertex range per
+    /// panel rather than per mesh is what keeps the draw count at "one per
+    /// visible panel" instead of "one per widget".
+    pub fn from_shapes(shapes: &[ClippedShape]) -> UiDrawData {
         let mut data = UiDrawData::default();
-        let atlas = atlas_id(textures);
+        let mut budget = MAX_UI_VERTICES;
+        let mut current: Option<UiBatch> = None;
+
         for shape in shapes {
-            match shape {
-                egui::Shape::Mesh(mesh) => {
-                    push_mesh(&mut data, mesh, atlas);
-                }
-                egui::Shape::Callback(_) => {}
-                _ => {}
+            let Shape::Mesh(mesh) = &shape.shape else {
+                continue;
+            };
+            let clip = clip_bounds(shape);
+            if !clip_is_visible(clip) {
+                data.clipped += 1;
+                continue;
             }
+            let mut batch = UiBatch {
+                vertices: Vec::new(),
+                clip,
+            };
+            let (added, skipped) = append_mesh(&mut batch, mesh, budget);
+            if added == 0 {
+                data.dropped += skipped;
+                continue;
+            }
+            budget -= added;
+            data.dropped += skipped;
+            match &mut current {
+                Some(open) if same_clip(open.clip, clip) => {
+                    open.vertices.extend(batch.vertices);
+                }
+                Some(open) => {
+                    data.batches.push(std::mem::replace(open, batch));
+                }
+                None => current = Some(batch),
+            }
+        }
+        if let Some(batch) = current
+            && !batch.is_empty()
+        {
+            data.batches.push(batch);
         }
         data
     }
 }
 
-/// The font atlas texture egui filled this frame, if it filled one.
-fn atlas_id(textures: &TexturesDelta) -> Option<egui::TextureId> {
-    textures
-        .iter()
-        .find(|(id, delta)| {
-            matches!(id, egui::TextureId::Font(egui::FontId::Proportional))
-                && !matches!(delta, egui::ImageDelta::Diff(Vec::new()))
-        })
-        .map(|(id, _)| *id)
+/// The clip rectangle of a shape, as `(min_x, min_y, max_x, max_y)`.
+fn clip_bounds(shape: &ClippedShape) -> (f32, f32, f32, f32) {
+    let r = shape.clip_rect;
+    (r.min.x, r.min.y, r.max.x, r.max.y)
 }
 
-/// Append one mesh's triangles, clipped to the shape's rectangle.
-fn push_mesh(data: &mut UiDrawData, mesh: &Mesh, _atlas: Option<egui::TextureId>) {
-    // egui indices are u32 and can address a shared vertex buffer; this walks
-    // them three at a time because the UI pipeline is an indexed-free triangle
-    // list.
+/// True when a clip rectangle could contribute a visible pixel.
+///
+/// A non-finite rectangle is treated as visible: it is a malformed frame, and
+/// dropping it would blank the editor for as long as the malformation lasts,
+/// which is a far worse failure than drawing a panel in the wrong place for one
+/// frame.
+fn clip_is_visible(clip: (f32, f32, f32, f32)) -> bool {
+    let (min_x, min_y, max_x, max_y) = clip;
+    if !min_x.is_finite() || !min_y.is_finite() || !max_x.is_finite() || !max_y.is_finite() {
+        return true;
+    }
+    max_x > 0.0 && max_y > 0.0 && min_x < 1.0e5 && min_y < 1.0e5
+}
+
+/// True when two clip rectangles would produce the same scissor.
+///
+/// Compared after rounding, because the scissor is integral: two rectangles a
+/// hundredth of a pixel apart clip identically, so treating them as different
+/// would split a batch for nothing.
+fn same_clip(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
+    let r = |v: f32| {
+        let v = if v.is_finite() { v } else { 0.0 };
+        (v * 64.0).round() / 64.0
+    };
+    (r(a.0), r(a.1), r(a.2), r(a.3)) == (r(b.0), r(b.1), r(b.2), r(b.3))
+}
+
+/// Append one mesh's triangles under a clip rectangle, within a budget.
+///
+/// Indices are walked three at a time because the UI pipeline reads a flat
+/// triangle stream rather than an index buffer: egui's meshes share vertices,
+/// and the pipeline has no index buffer to share them through.
+fn append_mesh(batch: &mut UiBatch, mesh: &Mesh, budget: usize) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut skipped = 0usize;
     for triangle in mesh.indices.chunks_exact(3) {
-        if data.vertices.len() + 3 > MAX_UI_VERTICES {
-            return;
+        if added + 3 > budget {
+            skipped += 1;
+            continue;
         }
-        let mut corners = [Pos2::ZERO; 3];
         let mut usable = true;
-        for (i, &index) in triangle.iter().enumerate() {
-            match mesh.vertices.get(index as usize) {
-                Some(v) => corners[i] = v.pos,
-                None => {
-                    // A mesh whose indices point past its vertices is
-                    // malformed; skipping the triangle is better than
-                    // panicking inside a draw call.
-                    usable = false;
-                    break;
-                }
+        for &index in triangle {
+            if mesh.vertices.get(index as usize).is_none() {
+                // A mesh whose indices point past its vertices is malformed;
+                // skipping the triangle beats panicking inside a draw call.
+                usable = false;
+                break;
             }
         }
         if !usable {
-            data.clipped += 1;
+            skipped += 1;
             continue;
         }
         for &index in triangle {
-            let Some(v) = mesh.vertices.get(index as usize) else {
-                continue;
-            };
-            data.vertices.push(vertex_from(v));
+            if let Some(v) = mesh.vertices.get(index as usize) {
+                batch.vertices.push(vertex_from(v));
+            }
         }
+        added += 3;
     }
+    (added, skipped)
 }
 
 /// Convert one egui vertex to the UI pipeline's vertex.
 ///
 /// The colour is written as-is: egui's colours are already premultiplied
 /// alpha, and the UI pipeline blends with the matching one/one-minus-src-alpha
-/// factors, so un-premultiplying here would double-apply the alpha and make
-/// every panel edge too dark.
+/// factors, so un-premultiplying here would apply the alpha twice and make every
+/// panel edge too dark.
 fn vertex_from(v: &Vertex) -> UiVertex {
     UiVertex {
         position: [v.pos.x, v.pos.y],
@@ -127,58 +208,93 @@ fn vertex_from(v: &Vertex) -> UiVertex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::epaint::{TextureId, emath::Rect};
+
+    fn vertex(x: f32, y: f32) -> Vertex {
+        Vertex {
+            pos: Pos2::new(x, y),
+            uv: Pos2::ZERO,
+            color: egui::Color32::WHITE,
+        }
+    }
+
+    fn mesh_of(indices: Vec<u32>, vertices: Vec<Vertex>) -> Mesh {
+        Mesh {
+            indices,
+            vertices,
+            texture_id: TextureId::default(),
+        }
+    }
+
+    fn clipped(clip: Rect, mesh: Mesh) -> ClippedShape {
+        ClippedShape {
+            clip_rect: clip,
+            shape: Shape::Mesh(std::sync::Arc::new(mesh)),
+        }
+    }
+
+    fn triangle() -> Mesh {
+        mesh_of(
+            vec![0, 1, 2],
+            vec![vertex(0.0, 0.0), vertex(10.0, 0.0), vertex(0.0, 10.0)],
+        )
+    }
+
+    fn full_screen() -> Rect {
+        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1920.0, 1080.0))
+    }
 
     #[test]
     fn no_shapes_is_no_geometry() {
-        let d = UiDrawData::from_primitives(&[], &TexturesDelta::default());
+        let d = UiDrawData::from_shapes(&[]);
         assert!(d.is_empty());
         assert_eq!(d.len(), 0);
     }
 
     #[test]
     fn a_mesh_becomes_triangles() {
-        let mesh = egui::Mesh {
-            vertices: vec![
-                Vertex {
-                    pos: Pos2::new(0.0, 0.0),
-                    uv: Pos2::ZERO,
-                    color: egui::Color32::WHITE,
-                },
-                Vertex {
-                    pos: Pos2::new(10.0, 0.0),
-                    uv: Pos2::ZERO,
-                    color: egui::Color32::WHITE,
-                },
-                Vertex {
-                    pos: Pos2::new(0.0, 10.0),
-                    uv: Pos2::ZERO,
-                    color: egui::Color32::WHITE,
-                },
-            ],
-            indices: vec![0, 1, 2],
-            texture_id: egui::TextureId::Font(egui::FontId::Proportional),
-        };
-        let shape = egui::Shape::Mesh(mesh);
-        let d = UiDrawData::from_primitives(&[shape], &TexturesDelta::default());
-        assert_eq!(d.len(), 3, "one triangle is three vertices");
+        let d = UiDrawData::from_shapes(&[clipped(full_screen(), triangle())]);
+        assert_eq!(d.len(), 3);
         assert!(!d.is_empty());
     }
 
     #[test]
-    fn a_quad_becomes_two_triangles() {
-        let mesh = egui::Mesh {
-            vertices: (0..4)
-                .map(|i| Vertex {
-                    pos: Pos2::new(i as f32, 0.0),
-                    uv: Pos2::ZERO,
-                    color: egui::Color32::WHITE,
-                })
-                .collect(),
-            indices: vec![0, 1, 2, 2, 3, 0],
-            texture_id: egui::TextureId::Font(egui::FontId::Proportional),
-        };
-        let d = UiDrawData::from_primitives(&[egui::Shape::Mesh(mesh)], &TexturesDelta::default());
+    fn a_quad_becomes_six_vertices() {
+        let mesh = mesh_of(
+            vec![0, 1, 2, 2, 3, 0],
+            (0..4).map(|i| vertex(i as f32, 0.0)).collect(),
+        );
+        assert_eq!(
+            UiDrawData::from_shapes(&[clipped(full_screen(), mesh)]).len(),
+            6
+        );
+    }
+
+    #[test]
+    fn meshes_under_one_clip_share_a_batch() {
+        let d = UiDrawData::from_shapes(&[
+            clipped(full_screen(), triangle()),
+            clipped(full_screen(), triangle()),
+        ]);
+        assert_eq!(d.batch_count(), 1, "one panel is one draw call");
         assert_eq!(d.len(), 6);
+    }
+
+    #[test]
+    fn different_clips_make_different_batches() {
+        let other = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(400.0, 1080.0));
+        let d = UiDrawData::from_shapes(&[
+            clipped(full_screen(), triangle()),
+            clipped(other, triangle()),
+        ]);
+        assert_eq!(d.batch_count(), 2);
+    }
+
+    #[test]
+    fn a_batch_carries_its_clip() {
+        let other = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(400.0, 1080.0));
+        let d = UiDrawData::from_shapes(&[clipped(other, triangle())]);
+        assert_eq!(d.batches[0].clip, (10.0, 20.0, 400.0, 1080.0));
     }
 
     #[test]
@@ -186,7 +302,7 @@ mod tests {
         let v = Vertex {
             pos: Pos2::new(3.0, 4.0),
             uv: Pos2::new(0.5, 0.5),
-            color: egui::Color32::from_rgba_unmultiplied(10, 20, 30, 40),
+            color: egui::Color32::from_rgba_premultiplied(10, 20, 30, 40),
         };
         let out = vertex_from(&v);
         assert_eq!(out.position, [3.0, 4.0]);
@@ -194,9 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn a_colour_is_carried_unchanged() {
-        // egui's colours are premultiplied; rewriting them here would double the
-        // alpha and darken every panel edge.
+    fn a_premultiplied_colour_is_carried_unchanged() {
         let v = Vertex {
             pos: Pos2::ZERO,
             uv: Pos2::ZERO,
@@ -206,80 +320,65 @@ mod tests {
     }
 
     #[test]
-    fn an_index_past_the_vertices_is_counted_not_panicked() {
-        let mesh = egui::Mesh {
-            vertices: vec![Vertex {
-                pos: Pos2::ZERO,
-                uv: Pos2::ZERO,
-                color: egui::Color32::WHITE,
-            }],
-            indices: vec![0, 1, 2],
-            texture_id: egui::TextureId::Font(egui::FontId::Proportional),
-        };
-        let d = UiDrawData::from_primitives(&[egui::Shape::Mesh(mesh)], &TexturesDelta::default());
-        assert!(d.is_empty(), "the malformed triangle is dropped");
+    fn an_index_past_the_vertices_is_skipped() {
+        let mesh = mesh_of(vec![0, 1, 2], vec![vertex(0.0, 0.0)]);
+        let mut batch = UiBatch::default();
+        let (added, skipped) = append_mesh(&mut batch, &mesh, MAX_UI_VERTICES);
+        assert_eq!(added, 0);
+        assert_eq!(skipped, 1, "the malformed triangle is counted");
+    }
+
+    #[test]
+    fn an_incomplete_triangle_is_skipped() {
+        let mesh = mesh_of(vec![0, 1], vec![vertex(0.0, 0.0), vertex(1.0, 0.0)]);
+        let mut batch = UiBatch::default();
+        let (added, _) = append_mesh(&mut batch, &mesh, MAX_UI_VERTICES);
+        assert_eq!(added, 0, "two indices are not a triangle");
+    }
+
+    #[test]
+    fn a_clip_entirely_off_screen_is_dropped() {
+        let off = Rect::from_min_max(Pos2::new(-5000.0, -5000.0), Pos2::new(-4000.0, -4000.0));
+        let d = UiDrawData::from_shapes(&[clipped(off, triangle())]);
+        assert!(d.is_empty());
         assert_eq!(d.clipped, 1);
     }
 
     #[test]
-    fn an_incomplete_triangle_is_dropped() {
-        // Two indices is not a triangle; chunks_exact skips it.
-        let mesh = egui::Mesh {
-            vertices: vec![
-                Vertex {
-                    pos: Pos2::ZERO,
-                    uv: Pos2::ZERO,
-                    color: egui::Color32::WHITE,
-                },
-                Vertex {
-                    pos: Pos2::new(1.0, 0.0),
-                    uv: Pos2::ZERO,
-                    color: egui::Color32::WHITE,
-                },
-            ],
-            indices: vec![0, 1],
-            texture_id: egui::TextureId::Font(egui::FontId::Proportional),
-        };
-        let d = UiDrawData::from_primitives(&[egui::Shape::Mesh(mesh)], &TexturesDelta::default());
-        assert!(d.is_empty());
+    fn a_non_finite_clip_is_kept_rather_than_dropped() {
+        let bad = Rect::from_min_max(Pos2::new(f32::NAN, 0.0), Pos2::new(100.0, 100.0));
+        let d = UiDrawData::from_shapes(&[clipped(bad, triangle())]);
+        assert!(!d.is_empty(), "a malformed frame must not blank the editor");
     }
 
     #[test]
     fn the_byte_length_matches_the_vertex_count() {
-        let mesh = egui::Mesh {
-            vertices: (0..3)
-                .map(|_| Vertex {
-                    pos: Pos2::ZERO,
-                    uv: Pos2::ZERO,
-                    color: egui::Color32::WHITE,
-                })
-                .collect(),
-            indices: vec![0, 1, 2],
-            texture_id: egui::TextureId::Font(egui::FontId::Proportional),
-        };
-        let d = UiDrawData::from_primitives(&[egui::Shape::Mesh(mesh)], &TexturesDelta::default());
+        let d = UiDrawData::from_shapes(&[clipped(full_screen(), triangle())]);
         assert_eq!(d.byte_len(), d.len() * std::mem::size_of::<UiVertex>());
     }
 
     #[test]
     fn the_vertex_cap_is_a_multiple_of_three() {
+        // A triangle list cannot draw a partial triangle, so a cap that is not a
+        // multiple of three would leave one at the end.
         assert_eq!(UiDrawData::capacity() % 3, 0);
     }
 
     #[test]
-    fn many_triangles_stay_within_the_cap() {
-        let mesh = egui::Mesh {
-            vertices: (0..3)
-                .map(|_| Vertex {
-                    pos: Pos2::ZERO,
-                    uv: Pos2::ZERO,
-                    color: egui::Color32::WHITE,
-                })
-                .collect(),
-            indices: (0..(3 * 10_000)).map(|i| (i % 3) as u32).collect(),
-            texture_id: egui::TextureId::Font(egui::FontId::Proportional),
-        };
-        let d = UiDrawData::from_primitives(&[egui::Shape::Mesh(mesh)], &TexturesDelta::default());
-        assert!(d.len() <= UiDrawData::capacity());
+    fn a_mesh_beyond_the_budget_is_truncated_not_unbounded() {
+        let mesh = mesh_of(
+            (0..3 * 10).map(|i| (i % 3) as u32).collect(),
+            (0..3).map(|i| vertex(i as f32, 0.0)).collect(),
+        );
+        let mut batch = UiBatch::default();
+        let (added, skipped) = append_mesh(&mut batch, &mesh, 6);
+        assert_eq!(added, 6, "only the budget is taken");
+        assert_eq!(skipped, 8, "the other eight triangles are dropped");
+        assert_eq!(batch.vertices.len(), 6);
+    }
+
+    #[test]
+    fn an_empty_batch_reports_itself() {
+        assert!(UiBatch::default().is_empty());
     }
 }

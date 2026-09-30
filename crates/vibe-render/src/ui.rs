@@ -24,10 +24,11 @@ use vibe_shader::ShaderCompiler;
 
 /// The vertex the UI pipeline consumes.
 ///
-/// `#[repr(C)]` and 20 bytes. It is not padded to a multiple of 16 because the
-/// stride does not have to be: what that rule protects against is per-vertex
-/// fetch granularity, and 20 is a multiple of 4, which is the alignment the
-/// attributes themselves need.
+/// `#[repr(C)]` and 12 bytes: two position floats and four colour bytes. The
+/// fields add up exactly, so there is no padding and no hole for a `bytemuck`
+/// cast to read. The stride is not padded to a multiple of 16 because the rule
+/// that asks for one is about per-vertex fetch granularity on larger attributes,
+/// and every field here is 4-byte aligned.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct UiVertex {
@@ -441,16 +442,20 @@ pub fn scissor_from_bounds(
 /// A full 4K frame of dense UI is a few hundred thousand triangles; a million
 /// vertices is well past that and bounds the damage a pathological frame can do
 /// to the upload.
-pub const MAX_UI_VERTICES: usize = 1_048_576;
+///
+/// A multiple of three, because the pipeline is a triangle list and a vertex
+/// count that is not leaves a partial triangle at the end — which is a
+/// validation error, not a dropped fragment.
+pub const MAX_UI_VERTICES: usize = 1_048_575;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn a_ui_vertex_is_20_bytes() {
-        assert_eq!(std::mem::size_of::<UiVertex>(), 20);
-        assert_eq!(UI_VERTEX_SIZE, 20);
+    fn a_ui_vertex_is_12_bytes() {
+        assert_eq!(std::mem::size_of::<UiVertex>(), 12);
+        assert_eq!(UI_VERTEX_SIZE, 12);
     }
 
     #[test]
@@ -480,10 +485,9 @@ mod tests {
 
     #[test]
     fn the_layout_has_no_padding_hole() {
-        // 8 bytes of position plus 4 of colour is 12, and the stride is 20, so
-        // there are 8 bytes of tail padding. That is deliberate and safe: no
-        // attribute reads it, so a bytemuck cast cannot expose it.
-        assert!(ui_vertex_layout().has_padding());
+        // The fields add up to the stride exactly, so there is no tail padding
+        // for a bytemuck cast to expose.
+        assert!(!ui_vertex_layout().has_padding());
     }
 
     #[test]
@@ -538,11 +542,20 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_sized_surface_is_not_the_identity() {
-        // The identity would place vertices in the bottom-left quarter rather
-        // than blanking them, which is a worse failure than an empty screen.
+    fn a_zero_width_gives_a_zero_scale() {
+        // Zero width cannot be mapped onto clip space, so the scale is zero and
+        // the frame draws nothing. A NaN would be worse: it would blank the UI
+        // and keep it blanked.
         let t = ScreenTransform::for_size(0, 600);
-        assert_ne!(t.scale_offset[0], 0.0);
+        assert_eq!(t.scale_offset[0], 0.0);
+        assert!(t.scale_offset.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn a_zero_height_gives_a_zero_scale() {
+        let t = ScreenTransform::for_size(800, 0);
+        assert_eq!(t.scale_offset[1], 0.0);
+        assert!(t.scale_offset.iter().all(|v| v.is_finite()));
     }
 
     #[test]
@@ -551,8 +564,18 @@ mod tests {
     }
 
     #[test]
-    fn the_pipeline_description_is_valid() {
-        let desc = ui_pipeline_desc();
+    fn the_ui_description_fills_both_stages() {
+        let spirv = vibe_shader::compile_entry_point(
+            UI_SHADER,
+            vibe_shader::CompileOptions::release(),
+            Some((VERTEX_ENTRY, naga::ShaderStage::Vertex)),
+        )
+        .expect("the UI shader compiles");
+        let desc = PipelineDesc {
+            vertex_spirv: Some(spirv.clone()),
+            fragment_spirv: Some(spirv),
+            ..ui_pipeline_desc()
+        };
         assert!(desc.validate().is_ok(), "{:?}", desc.validate().err());
     }
 

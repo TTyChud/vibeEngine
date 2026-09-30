@@ -242,7 +242,6 @@ impl HierarchyPanel {
                 });
             }
         }
-        self.last_row_count = out.len();
         out
     }
 
@@ -272,6 +271,14 @@ impl HierarchyPanel {
         for child in self.children_of(entity) {
             self.push_row(world, *child, depth + 1, out, emitted);
         }
+    }
+
+    /// Record how many rows were drawn, for the panel's status line.
+    ///
+    /// `rows` is a pure query — a read-only traversal has no business writing
+    /// to the panel it reads from — so the count is set here, by whoever drew.
+    pub fn note_row_count(&mut self, count: usize) {
+        self.last_row_count = count;
     }
 
     /// The name shown for an entity.
@@ -315,7 +322,7 @@ mod tests {
     #[test]
     fn selecting_records_the_entity() {
         let mut p = HierarchyPanel::new();
-        let e = Entity::from_raw(0, 1);
+        let e = Entity::from_parts(0, 1);
         p.select(e);
         assert!(p.selection.is(e));
     }
@@ -323,28 +330,28 @@ mod tests {
     #[test]
     fn selecting_none_clears_it() {
         let mut p = HierarchyPanel::new();
-        p.select(Entity::from_raw(0, 1));
-        p.select(None);
+        p.selection.select(Some(Entity::from_parts(0, 1)));
+        p.selection.select(None);
         assert!(!p.selection.is_some());
     }
 
     #[test]
     fn clearing_removes_the_selection() {
         let mut p = HierarchyPanel::new();
-        p.select(Entity::from_raw(0, 1));
+        p.select(Entity::from_parts(0, 1));
         p.clear_selection();
         assert!(!p.selection.is_some());
     }
 
     #[test]
     fn an_unexpanded_entity_is_not_expanded() {
-        assert!(!HierarchyPanel::new().is_expanded(Entity::from_raw(0, 1)));
+        assert!(!HierarchyPanel::new().is_expanded(Entity::from_parts(0, 1)));
     }
 
     #[test]
     fn setting_expanded_expands() {
         let mut p = HierarchyPanel::new();
-        let e = Entity::from_raw(0, 1);
+        let e = Entity::from_parts(0, 1);
         p.set_expanded(e, true);
         assert!(p.is_expanded(e));
     }
@@ -352,7 +359,7 @@ mod tests {
     #[test]
     fn setting_not_expanded_collapses() {
         let mut p = HierarchyPanel::new();
-        let e = Entity::from_raw(0, 1);
+        let e = Entity::from_parts(0, 1);
         p.set_expanded(e, true);
         p.set_expanded(e, false);
         assert!(!p.is_expanded(e));
@@ -361,7 +368,7 @@ mod tests {
     #[test]
     fn toggling_flips_the_state() {
         let mut p = HierarchyPanel::new();
-        let e = Entity::from_raw(0, 1);
+        let e = Entity::from_parts(0, 1);
         p.toggle_expanded(e);
         assert!(p.is_expanded(e));
         p.toggle_expanded(e);
@@ -371,8 +378,8 @@ mod tests {
     #[test]
     fn collapsing_all_empties_the_set() {
         let mut p = HierarchyPanel::new();
-        p.set_expanded(Entity::from_raw(0, 1), true);
-        p.set_expanded(Entity::from_raw(1, 1), true);
+        p.set_expanded(Entity::from_parts(0, 1), true);
+        p.set_expanded(Entity::from_parts(1, 1), true);
         p.collapse_all();
         assert!(p.expanded.is_empty());
     }
@@ -591,7 +598,7 @@ mod tests {
     fn a_tag_becomes_the_label() {
         let mut w = World::new();
         let e = w.spawn();
-        w.insert(e, Tag("Player".to_string()));
+        w.add(e, Tag("Player".to_string()));
         assert_eq!(named_label(&w, e), "Player");
     }
 
@@ -606,7 +613,7 @@ mod tests {
     fn an_empty_tag_falls_back_to_the_index() {
         let mut w = World::new();
         let e = w.spawn();
-        w.insert(e, Tag(String::new()));
+        w.add(e, Tag(String::new()));
         assert!(named_label(&w, e).contains("Entity"));
     }
 

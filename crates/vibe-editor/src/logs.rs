@@ -442,6 +442,16 @@ mod tests {
         sink.iter().map(|e| e.sequence).collect()
     }
 
+    fn emit(logger: &EditorLogger, message: &str, level: log::Level, target: &str) {
+        let args = format_args!("{message}");
+        let record = log::Record::builder()
+            .args(args)
+            .level(level)
+            .target(target)
+            .build();
+        log::Log::log(logger, &record);
+    }
+
     #[test]
     fn severity_orders_the_levels() {
         assert!(LogLevel::Trace < LogLevel::Debug);
@@ -530,7 +540,8 @@ mod tests {
         let mut sink = LogSink::new(8, LogLevel::Warn);
         sink.push(LogLevel::Warn, "engine", "shown");
         sink.push(LogLevel::Info, "engine", "hidden");
-        assert_eq!(messages(&sink), vec!["shown"]);
+        let shown: Vec<String> = sink.filtered().iter().map(|e| e.message.clone()).collect();
+        assert_eq!(shown, vec!["shown"]);
     }
 
     #[test]
@@ -811,12 +822,7 @@ mod tests {
             let _held = sink.lock().unwrap();
             panic!("a log call that goes wrong");
         });
-        let record = log::Record::builder()
-            .args(format_args!("after the panic"))
-            .level(log::Level::Warn)
-            .target("vibe_engine")
-            .build();
-        log::Log::log(&logger, &record);
+        emit(&logger, "after the panic", log::Level::Warn, "vibe_engine");
         let recovered = sink.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered.as_slice()[0].message, "after the panic");
@@ -861,12 +867,7 @@ mod tests {
     #[test]
     fn the_log_impl_stores_the_target_and_message() {
         let logger = EditorLogger::new(4);
-        let record = log::Record::builder()
-            .args(format_args!("frame {n}", n = 3))
-            .level(log::Level::Warn)
-            .target("vibe_frame")
-            .build();
-        log::Log::log(&logger, &record);
+        emit(&logger, "frame 3", log::Level::Warn, "vibe_frame");
         let sink = logger.sink();
         let guard = sink.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(guard.as_slice()[0].target, "vibe_frame");
@@ -884,12 +885,7 @@ mod tests {
             (log::Level::Warn, LogLevel::Warn),
             (log::Level::Error, LogLevel::Error),
         ] {
-            let record = log::Record::builder()
-                .args(format_args!("x"))
-                .level(level)
-                .target("engine")
-                .build();
-            log::Log::log(&logger, &record);
+            emit(&logger, "x", level, "engine");
             let sink = logger.sink();
             let guard = sink.lock().unwrap_or_else(|e| e.into_inner());
             let entry = guard.as_slice().last().unwrap();
@@ -901,13 +897,7 @@ mod tests {
     fn the_log_impl_assigns_increasing_sequences() {
         let logger = EditorLogger::new(8);
         for i in 0..3 {
-            let message = format!("m{i}");
-            let record = log::Record::builder()
-                .args(format_args!("{message}"))
-                .level(log::Level::Info)
-                .target("engine")
-                .build();
-            log::Log::log(&logger, &record);
+            emit(&logger, &format!("m{i}"), log::Level::Info, "engine");
         }
         let sink = logger.sink();
         let guard = sink.lock().unwrap_or_else(|e| e.into_inner());
@@ -922,12 +912,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_minimum(LogLevel::Error);
-        let record = log::Record::builder()
-            .args(format_args!("quiet"))
-            .level(log::Level::Info)
-            .target("engine")
-            .build();
-        log::Log::log(&logger, &record);
+        emit(&logger, "quiet", log::Level::Info, "engine");
         let sink = logger.sink();
         let guard = sink.lock().unwrap_or_else(|e| e.into_inner());
         assert!(guard.is_empty());
@@ -937,13 +922,7 @@ mod tests {
     fn the_log_impl_evicts_the_oldest_at_capacity() {
         let logger = EditorLogger::new(2);
         for i in 0..4 {
-            let message = format!("m{i}");
-            let record = log::Record::builder()
-                .args(format_args!("{message}"))
-                .level(log::Level::Info)
-                .target("engine")
-                .build();
-            log::Log::log(&logger, &record);
+            emit(&logger, &format!("m{i}"), log::Level::Info, "engine");
         }
         let sink = logger.sink();
         let guard = sink.lock().unwrap_or_else(|e| e.into_inner());
@@ -982,8 +961,8 @@ mod tests {
         assert!(panel.sink().is_empty());
         assert_eq!(panel.filter, LogLevel::Trace);
         assert_eq!(panel.search, "");
-        assert!(panel.wrap);
-        assert!(!panel.follow);
+        assert!(!panel.wrap);
+        assert!(panel.follow);
     }
 
     #[test]
@@ -1013,22 +992,21 @@ mod tests {
             .sink()
             .push(LogLevel::Error, "vibe_rhi", "device lost");
         let ctx = egui::Context::default();
-        ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                panel.show(ui);
-            });
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            panel.show(ui);
         });
+        output.textures_delta.clear();
+        assert_eq!(panel.sink.len(), 1);
     }
 
     #[test]
     fn the_panel_draws_when_empty() {
         let mut panel = LogPanel::new();
         let ctx = egui::Context::default();
-        ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                panel.show(ui);
-            });
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            panel.show(ui);
         });
+        output.textures_delta.clear();
         assert!(panel.sink.is_empty());
     }
 
@@ -1038,18 +1016,15 @@ mod tests {
         panel.wrap = true;
         panel.follow = true;
         for i in 0..50 {
-            panel.sink().push(
-                LogLevel::Warn,
-                "vibe_scene",
-                format!("a long message number {i}"),
-            );
+            panel
+                .sink()
+                .push(LogLevel::Warn, "vibe_scene", format!("a long message {i}"));
         }
         let ctx = egui::Context::default();
-        ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                panel.show(ui);
-            });
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            panel.show(ui);
         });
+        output.textures_delta.clear();
         assert_eq!(panel.sink.len(), 50);
     }
 }

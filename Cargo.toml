@@ -15,6 +15,7 @@ members = [
     "crates/vibe-window",
     "crates/vibe-render",
     "crates/vibe-audio",
+    "crates/vibe-gltf",
 ]
 
 [workspace.package]
@@ -39,6 +40,7 @@ vibe-render = { path = "crates/vibe-render" }
 vibe-audio = { path = "crates/vibe-audio" }
 vibe-scene = { path = "crates/vibe-scene" }
 vibe-physics = { path = "crates/vibe-physics" }
+vibe-gltf = { path = "crates/vibe-gltf" }
 
 ash = "0.38"
 serde = { version = "1", features = ["derive"] }
